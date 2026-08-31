@@ -50,6 +50,43 @@ DAMAGE_PENALTY_SCALE_M = 300.0
 PARAM_NAMES: tuple[str, ...] = tuple(field.name for field in fields(ReactiveParams))
 Genome = tuple[float, ...]
 
+# Sensible physical/behavioral bounds per parameter, so mutation cannot waste
+# evaluations on nonsensical values (e.g. negative distances, a steer limit
+# above 1.0, a braking gain of zero). Keyed by field name; any field not
+# listed is left unclamped.
+PARAM_BOUNDS: dict[str, tuple[float, float]] = {
+    "center_offset_gain": (0.0, 0.5),
+    "heading_error_gain": (0.0, 0.5),
+    "lookahead_near_gain": (0.0, 0.3),
+    "lookahead_far_gain": (0.0, 0.3),
+    "wall_avoid_margin_m": (0.5, 6.5),
+    "wall_avoid_gain": (0.0, 1.0),
+    "emergency_front_m": (0.5, 5.0),
+    "emergency_steer": (0.0, 3.0),
+    "recovery_steer": (0.0, 2.0),
+    "recovery_throttle": (-1.0, 0.0),
+    "steer_limit": (0.2, 1.0),
+    "turn_sharpness_deg": (5.0, 90.0),
+    "apex_bias_max_m": (0.0, 2.0),
+    "max_speed_mps": (5.0, 30.0),
+    "speed_gain": (0.05, 1.5),
+    "corner_speed_gain": (0.0, 0.9),
+    "corner_signal_deg": (5.0, 120.0),
+    "corner_yaw_rate_deg_per_s": (5.0, 300.0),
+    "brake_lead_time_s": (0.0, 2.0),
+    "brake_min_distance_m": (0.1, 3.0),
+    "brake_gain": (0.1, 3.0),
+    "brake_quadratic_coeff": (0.0, 0.5),
+}
+
+
+def _clamp_gene(name: str, value: float) -> float:
+    bounds = PARAM_BOUNDS.get(name)
+    if bounds is None:
+        return value
+    low, high = bounds
+    return min(max(value, low), high)
+
 
 def genome_from_params(params: ReactiveParams) -> Genome:
     """Flatten a ReactiveParams into a genome tuple, in dataclass field order."""
@@ -62,11 +99,11 @@ def params_from_genome(genome: Genome) -> ReactiveParams:
 
 
 def mutate(genome: Genome, rng: random.Random, sigma_fraction: float) -> Genome:
-    """Perturb each gene by Gaussian noise scaled to that gene's own magnitude."""
+    """Perturb each gene by Gaussian noise scaled to that gene's own magnitude, then clamp to bounds."""
     mutated: list[float] = []
-    for value in genome:
+    for name, value in zip(PARAM_NAMES, genome, strict=True):
         step_sigma = max(abs(value), 0.05) * sigma_fraction
-        mutated.append(value + rng.gauss(0.0, step_sigma))
+        mutated.append(_clamp_gene(name, value + rng.gauss(0.0, step_sigma)))
     return tuple(mutated)
 
 
@@ -122,10 +159,18 @@ def run_search(
     seeds: tuple[int, ...],
     round_seconds: float,
     rng_seed: int,
+    seed_genome: Genome | None = None,
 ) -> tuple[ReactiveParams, float]:
-    """Run the evolution strategy; return the best params found and their fitness."""
+    """Run the evolution strategy; return the best params found and their fitness.
+
+    Seeds the initial population from ``seed_genome`` (defaults to the current
+    DEFAULT_PARAMS) rather than random init, so every generation's worst
+    genome is still a plausible driver. Passing a previous call's best params
+    back in as ``seed_genome`` chains a broad-exploration phase into a
+    fine-tuning phase.
+    """
     rng = random.Random(rng_seed)
-    base_genome = genome_from_params(DEFAULT_PARAMS)
+    base_genome = genome_from_params(DEFAULT_PARAMS) if seed_genome is None else seed_genome
     population = [base_genome] + [
         mutate(base_genome, rng, mutation_sigma_fraction) for _ in range(population_size - 1)
     ]
@@ -265,11 +310,18 @@ def main() -> None:
         "--seeds",
         type=int,
         nargs="+",
-        default=[13, 55],
-        help="Training seeds, kept distinct from the held-out evaluation suite",
+        default=[13, 55, 110, 271, 997],
+        help="Training seeds, kept distinct from the held-out validation suite",
     )
     parser.add_argument("--round-seconds", type=float, default=20.0)
     parser.add_argument("--rng-seed", type=int, default=1, help="Seed for the evolutionary search's own randomness")
+    parser.add_argument(
+        "--phase2-generations",
+        type=int,
+        default=0,
+        help="If > 0, run a second fine-tuning phase for this many generations, seeded from phase 1's best",
+    )
+    parser.add_argument("--phase2-mutation-sigma-fraction", type=float, default=0.08)
     parser.add_argument("--diagnose", action="store_true", help="Skip search; trace DEFAULT_PARAMS on --seed instead")
     parser.add_argument("--seed", type=int, default=110, help="Seed used by --diagnose")
     parser.add_argument("--diagnose-round-seconds", type=float, default=30.0)
@@ -281,6 +333,7 @@ def main() -> None:
         summarize_trace(trace, stats, seed=args.seed, tail=args.tail)
         return
 
+    print(f"=== Phase 1: broad exploration (sigma={args.mutation_sigma_fraction}) ===")
     best_params, best_fitness = run_search(
         population_size=args.population,
         generations=args.generations,
@@ -290,6 +343,19 @@ def main() -> None:
         round_seconds=args.round_seconds,
         rng_seed=args.rng_seed,
     )
+
+    if args.phase2_generations > 0:
+        print(f"=== Phase 2: fine-tuning (sigma={args.phase2_mutation_sigma_fraction}) ===")
+        best_params, best_fitness = run_search(
+            population_size=args.population,
+            generations=args.phase2_generations,
+            elite_count=args.elite,
+            mutation_sigma_fraction=args.phase2_mutation_sigma_fraction,
+            seeds=tuple(args.seeds),
+            round_seconds=args.round_seconds,
+            rng_seed=args.rng_seed + 1,
+            seed_genome=genome_from_params(best_params),
+        )
 
     print("-" * 72)
     print(f"best training fitness: {best_fitness:.1f}m (seeds {args.seeds}, {args.round_seconds:.0f}s rounds)")

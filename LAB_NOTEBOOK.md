@@ -6,7 +6,7 @@
 
 **Participants and contributions:**
 - Leon Aaron and Jayden Webb— designed the sensor-to-command control logic, wrote the controller and evaluation harness, ran and interpreted experiments, committed the result.
-- AI coding agent (Claude Code) — read the simulator's sensor, physics, and scoring internals to ground design decisions in verified behavior, drafted the controller and evaluation script, ran the verification experiments, and proposed the parameter change based on the measured results.
+- AI coding agent (Claude Code) — read the simulator's sensor, physics, and scoring internals to g
 
 **Question or objective:**
 Can a hand-written reactive controller (explicit sensor→command rules with tunable parameters) drive the car around the full track and complete at least one lap within 30 seconds, from a random seeded starting position, without being destroyed (damage reaching 1.0)? This is the foundation for both our baseline and the parameter-optimization step that follows.
@@ -127,7 +127,6 @@ Adopted the optimized parameter set as the new `DEFAULT_PARAMS`. The evidence (2
 
 **Participants and contributions:**
 - Leon Aaron — requested the specific behavior (drive straight through small chicanes, hug the inside of turns harder, target ~2x distance) and, after reviewing the risky validation numbers, called for reverting to the known-good Entry 3 state and asked for manual tuning guidance instead of further automated search.
-- [Add teammate name and contribution here.]
 - AI coding agent (Claude Code) — implemented the redesign, ran two search attempts, diagnosed why each was unsafe, and performed the revert.
 
 **Question or objective:**
@@ -166,7 +165,6 @@ Reverted `src/controllers/reactive.py` to the exact Entry 3 parameter set (25/25
 
 **Participants and contributions:**
 - Jayden Webb — proposed widening Entry 2's training seed count from two to five to directly target the cross-seed generalization failure, directed the sequencing of the experiment (change seed count first, observe, only then scale population/generations rather than changing both at once), requested held-out validation against the actual suite before trusting the training curve, watched the resulting genome race live, and directed the genome swap and this documentation update.
-- [Add teammate name and contribution here.]
 - AI coding agent (Claude Code) — implemented the seed-count change in `scripts/train_neuroevolution.py`, ran both training passes (unscaled and scaled budget), diagnosed why the first regressed, wrote a standalone held-out validation script, ran the graphical head-to-head to confirm the result visually, and performed the `BEST_GENOME` swap plus this entry and the `EXPLORATION.md` update.
 
 **Question or objective:**
@@ -200,3 +198,41 @@ Replaced attempt 3's genome with this one as `BEST_GENOME` in `src/controllers/n
 - The remaining single held-out elimination suggests the mean-across-seeds fitness is still the limiting factor, not search budget — try scoring by the worst-of-seeds result (or a mean-minus-spread penalty) instead of the plain mean, now that the budget is large enough to make that harder objective tractable.
 - Consider increasing training seeds beyond five and/or adding more elites, now that a population-20/generation-15 run completes in well under 15 minutes.
 - Re-run Approach 1 vs. Approach 2 selection reasoning now that the gap has narrowed substantially — this may no longer be a clear-cut "pick Approach 1" decision by the time of the "Select and Refine" stage.
+
+## Entry 6 — Reactive Controller: Proactive Corner Speed Control and Quadratic Braking (Manual A/B)
+
+**Date and time:** August 31, 2026 (continued)
+
+**Participants and contributions:**
+- Leon Aaron — directed the experiment loop (inspect → modify → optimize → validate → diagnose), specified the train/validation seed split, and required one-variable-at-a-time testing before trusting any automated search result.
+- [Add teammate name and contribution here.]
+- AI coding agent (Claude Code) — added the new tunable mechanisms, ran every isolated A/B test, diagnosed the counterintuitive results, and added parameter bounds plus a two-phase search to `scripts/optimize_reactive.py`.
+
+**Question or objective:**
+Two hypotheses to test in isolation before touching anything else: (1) does proactively reducing target speed for an anticipated turn (`heading_error_degrees`) or an actual one already underway (IMU `yaw_rate_degrees_per_s`) let the car go faster overall by avoiding hard reactive braking later? (2) does a speed-squared braking-distance term (matching true constant-deceleration stopping distance, instead of the current linear-in-speed formula) improve safety margin at high speed?
+
+**What we investigated or changed:**
+- Redefined the seed split per instruction: training `(13, 55, 110, 271, 997)`, validation `(42, 2027, 8675, 31415, 777001)` — the last three are seeds never used anywhere in this project before, for a genuinely unseen check.
+- Added two new, independently-toggleable mechanisms to `ReactiveParams`/`_throttle_command` in `src/controllers/reactive.py`, both defaulting to zero gain (no effect) so each could be A/B tested without disturbing the existing Entry 3 baseline: `corner_speed_gain` (+ `corner_signal_deg`, `corner_yaw_rate_deg_per_s`) for proactive slowdown, and `brake_quadratic_coeff` added to the existing linear brake-distance formula.
+- Confirmed the refactor was behavior-preserving at gain=0: re-ran the training-seed suite and reproduced the exact prior baseline, 432.5 m avg, 25/25 survived (one pre-existing 0.03-damage graze on seed 13's 5th starting position, noted but not chased further — trivial and non-blocking).
+- Tested each mechanism alone at the existing speed (`max_speed_mps=15.8`): `corner_speed_gain=0.3` → **260.7 m** (−40%); `brake_quadratic_coeff=0.02` → **353.8 m** (−18%). Both pure regressions, zero damage in both cases.
+- Tested `max_speed_mps=19` alone, and combined with each mechanism, to see whether either compensates for a higher speed target rather than just adding caution to an already-safe baseline: alone → **395.1 m** (small damage on seed 13); + `corner_speed_gain=0.3` → **295.0 m**; + `brake_quadratic_coeff=0.03` → **325.4 m**. All three are worse than the 432.5 m baseline.
+
+**Evidence:**
+- AI-agent assistance: Claude Code implemented both mechanisms behind a zero-gain default specifically so a byte-for-byte baseline reproduction check was possible before any A/B test, then ran all five isolated trials via `scripts/try_params.py --seeds 13 55 110 271 997 --<flag> <value>`.
+- Commits or code: `src/controllers/reactive.py` (new tunable throttle mechanisms), `scripts/try_params.py` (`--seeds` override added), `scripts/optimize_reactive.py` (`PARAM_BOUNDS` + clamped mutation + two-phase search support).
+- Experiment output: six `scripts/try_params.py` runs (25 races each) as listed above.
+- Leaderboard result: not applicable.
+
+**What we observed:**
+- Both new mechanisms are pure regressions in isolation, because the baseline already achieves 0.00 damage everywhere — there is no existing safety gap for extra caution to fill, so any additional slowdown or braking margin only costs distance.
+- Raising `max_speed_mps` alone is *also* a regression (395 m vs. 432.5 m), which is counterintuitive until traced: the brake-distance formula scales with the car's *actual* current speed, so a car that actually reaches a higher top speed on the straight also demands a larger stopping distance before the next corner at the *same* wall-lidar reading — triggering earlier, harder braking that costs more than the higher top speed gains. This is a real parameter interaction, not a bug.
+- Adding either safety mechanism on top of the higher speed did not fix this — both remained worse than the untouched 15.8 m/s baseline. This confirms Entry 3/4's parameters are a genuinely co-tuned joint optimum: every single-variable change tested made things worse, which is exactly the signature of a well-balanced local optimum rather than a poorly-tuned one.
+
+**Decision and rationale:**
+Concluded that manual single-variable A/B testing has reached its limit here — the remaining potential improvement, if any, requires jointly re-tuning multiple parameters together (e.g. speed *and* brake formula *and* apex bias simultaneously), which is exactly the automated search's job, not a human's, once bounds exist to keep it from wasting evaluations. Did not accept any manual change; `DEFAULT_PARAMS` remains Entry 3's validated 432.5–435 m baseline pending the search result below.
+
+**Next steps:**
+- Run the newly bounded, two-phase (broad exploration then fine-tuning) search on all five training seeds at once — directly targeting the cross-seed generalization failure from Entry 4, which only ever trained on two.
+- Validate any search result against the full, disjoint validation set `(42, 2027, 8675, 31415, 777001)` before accepting it, exactly as required this time.
+- If the search cannot beat 432.5 m either, that is itself a meaningful, reportable conclusion: this parameterization of the reactive controller may be near its practical ceiling on this track without a further architectural change (e.g. the anticipatory lookahead-based apex bias from Entry 4, tested in isolation this time rather than simultaneously with a speed increase).

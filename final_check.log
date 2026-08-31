@@ -1,0 +1,15 @@
+Overrides: (none — testing DEFAULT_PARAMS as-is)
+seed 13: survived 5/5, avg_dist=451.9m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 55: survived 5/5, avg_dist=429.8m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 110: survived 5/5, avg_dist=427.3m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 271: survived 5/5, avg_dist=450.6m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 997: survived 5/5, avg_dist=451.8m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 42: survived 5/5, avg_dist=451.7m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 2027: survived 5/5, avg_dist=434.0m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 8675: survived 5/5, avg_dist=455.0m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 31415: survived 5/5, avg_dist=448.8m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 777001: survived 5/5, avg_dist=435.2m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 5: survived 5/5, avg_dist=439.5m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 99999: survived 5/5, avg_dist=461.8m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+------------------------------------------------------------
+TOTAL: survived 60/60, avg_dist=444.8m, max_dist=475.9m

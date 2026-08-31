@@ -5,7 +5,7 @@ parameter-search step (random search, Optuna, CMA-ES, ...) can explore the
 knob space by calling :func:`drive` with different parameter sets, without
 touching the control logic itself.
 
-Two design choices worth noting:
+Design notes:
 
 - Steering targets an "apex" offset biased toward the inside of the upcoming
   turn (right for a right turn, left for a left turn), inferred from the sign
@@ -13,11 +13,14 @@ Two design choices worth noting:
   scores forward progress as centerline projection rather than physical path
   length, cutting the inside of a turn advances scored distance per meter
   actually driven.
-- Throttle always targets ``max_speed_mps``; there is no proactive
-  slow-down for corners. The only source of negative throttle is the
-  reactive, wall-proximity braking check — a hard safety floor against
-  destruction, not a cornering strategy. Turn geometry is handled entirely by
-  steering (apex bias + wall avoidance).
+- Throttle targets ``max_speed_mps`` by default, with two optional,
+  independently-tunable adjustments (each off by default via a 0 gain):
+  proactive corner slow-down (``corner_speed_gain``, driven by anticipated
+  heading error or actual yaw rate, whichever is sharper) and a
+  speed-squared term in the braking-distance formula (``brake_quadratic_coeff``,
+  matching true constant-deceleration stopping distance). The reactive,
+  wall-proximity braking check remains the hard safety floor against
+  destruction regardless of these settings.
 """
 
 from __future__ import annotations
@@ -34,46 +37,56 @@ RACING_COLOR = "#39D98A"
 class ReactiveParams:
     """Tunable gains and thresholds for the reactive controller.
 
-    Defaults are the result of scripts/optimize_reactive.py (evolution
-    strategy, seeded from a hand-tuned baseline). See LAB_NOTEBOOK.md, Entry 3.
-    Validated: 25/25 survived, 25/25 completed >=1 lap, 0.00 damage in every
-    race across the seed suite (42, 110, 271, 997, 2027), avg. ~435 m/30s.
+    Defaults are the result of scripts/optimize_reactive.py (bounded two-phase
+    evolution strategy, trained on 5 seeds). See LAB_NOTEBOOK.md, Entry 6.
+    Validated: 50/50 survived, 0.00 damage in every race across 5 training
+    seeds (13, 55, 110, 271, 997) and 5 disjoint validation seeds (42, 2027,
+    8675, 31415, 777001), avg. ~442-445 m/30s (up from a prior ~432-435 m).
     """
 
     # Steering: follow the track centerline and upcoming curvature.
-    center_offset_gain: float = 0.08509623824373289
-    heading_error_gain: float = 0.05791054478631408
-    lookahead_near_gain: float = 0.036385639649514995
-    lookahead_far_gain: float = 0.03652536774873335
+    center_offset_gain: float = 0.09437765812661737
+    heading_error_gain: float = 0.05761283755797004
+    lookahead_near_gain: float = 0.09033539947299812
+    lookahead_far_gain: float = 0.05150093277359806
 
     # Steering: nudge away from a close side wall before it becomes urgent.
-    wall_avoid_margin_m: float = 4.980647121782573
-    wall_avoid_gain: float = 0.232047729634254
+    wall_avoid_margin_m: float = 0.9984770482614183
+    wall_avoid_gain: float = 0.33676478535712756
 
     # Steering: override toward open space when a wall is immediately ahead.
-    emergency_front_m: float = 2.0344921028737457
-    emergency_steer: float = 2.1794681274516834
+    emergency_front_m: float = 2.500129543202483
+    emergency_steer: float = 0.8733926601175921
 
     # Steering: back away from active contact toward whichever side is open.
-    recovery_steer: float = 1.03633882463599
-    recovery_throttle: float = -0.3378246479078141
+    recovery_steer: float = 1.183216644687921
+    recovery_throttle: float = -0.21430855823458606
 
-    steer_limit: float = 0.6270346971392542
+    steer_limit: float = 1.0
 
     # Steering: infer turn sharpness from heading error and hug the inside
     # of the turn (right side on a right turn, left side on a left turn).
-    turn_sharpness_deg: float = 13.06080719185704
-    apex_bias_max_m: float = 0.4604484764745242
+    turn_sharpness_deg: float = 7.9347978275593345
+    apex_bias_max_m: float = 0.31137445196443336
 
-    # Throttle: always chase max speed; cornering is handled by steering, not
-    # by slowing down.
-    max_speed_mps: float = 15.815503530875
-    speed_gain: float = 0.5063421687653541
+    # Throttle: target speed, optionally reduced proactively for an anticipated
+    # turn (camera heading error) or an actual one already underway (yaw
+    # rate). corner_speed_gain settled near 0 in search — negligible effect.
+    max_speed_mps: float = 18.194525474628353
+    speed_gain: float = 0.33561427559043133
+    corner_speed_gain: float = 0.021591851522117442
+    corner_signal_deg: float = 41.85343568146501
+    corner_yaw_rate_deg_per_s: float = 49.77802577209076
 
-    # Throttle: brake in time for the wall directly ahead.
-    brake_lead_time_s: float = 0.24393703057360375
-    brake_min_distance_m: float = 0.2412588895512276
-    brake_gain: float = 1.4993178625857668
+    # Throttle: brake in time for the wall directly ahead. Distance is
+    # linear-in-speed plus an optional speed-squared term (true stopping
+    # distance under constant deceleration is quadratic in speed);
+    # brake_quadratic_coeff settled at 0 in search — not useful here.
+    brake_lead_time_s: float = 0.23534499772289047
+    brake_min_distance_m: float = 0.2620843869496009
+    brake_gain: float = 1.5356470476775665
+    brake_quadratic_coeff: float = 0.0
+    brake_quadratic_coeff: float = 0.0
 
 
 DEFAULT_PARAMS = ReactiveParams()
@@ -152,13 +165,34 @@ def _throttle_command(sensors: RobotSensors, params: ReactiveParams) -> float:
     speed_mps = sensors.odometry.speed_mps
     wall = sensors.wall_lidar
 
-    brake_distance_m = max(params.brake_min_distance_m, speed_mps * params.brake_lead_time_s)
+    brake_distance_m = max(
+        params.brake_min_distance_m,
+        speed_mps * params.brake_lead_time_s + params.brake_quadratic_coeff * speed_mps * speed_mps,
+    )
     if wall.front_m < brake_distance_m:
         deficit = _clamp((brake_distance_m - wall.front_m) / brake_distance_m, 0.0, 1.0)
         return -params.brake_gain * deficit
 
-    speed_error_mps = params.max_speed_mps - speed_mps
+    corner_signal = _corner_speed_signal(sensors, params)
+    target_speed_mps = params.max_speed_mps * (1.0 - params.corner_speed_gain * corner_signal)
+    speed_error_mps = target_speed_mps - speed_mps
     return _clamp(speed_error_mps * params.speed_gain, -1.0, 1.0)
+
+
+def _corner_speed_signal(sensors: RobotSensors, params: ReactiveParams) -> float:
+    """Return an anticipated-or-actual turn severity signal in [0, 1].
+
+    Combines the anticipated turn (camera heading error, known before the car
+    turns) with the actual turn already underway (IMU yaw rate), taking
+    whichever indicates the sharper need to slow down.
+    """
+    heading_signal = 0.0
+    if sensors.camera.visible and params.corner_signal_deg > 0.0:
+        heading_signal = _clamp(abs(sensors.camera.heading_error_degrees) / params.corner_signal_deg, 0.0, 1.0)
+    yaw_signal = 0.0
+    if params.corner_yaw_rate_deg_per_s > 0.0:
+        yaw_signal = _clamp(abs(sensors.imu.yaw_rate_degrees_per_s) / params.corner_yaw_rate_deg_per_s, 0.0, 1.0)
+    return max(heading_signal, yaw_signal)
 
 
 def _clamp(value: float, low: float, high: float) -> float:

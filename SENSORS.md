@@ -172,6 +172,7 @@ RobotSensors(
 ```
 
 The public dataclass definitions live in
-[`src/racing/student/api.py`](src/racing/student/api.py), and the simulator-side
+[`src/racing/student/api.
+py`](src/racing/student/api.py), and the simulator-side
 measurement calculations live in
 [`src/racing/race/sensors.py`](src/racing/race/sensors.py).

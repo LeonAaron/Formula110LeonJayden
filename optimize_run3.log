@@ -1,0 +1,68 @@
+=== Phase 1: broad exploration (sigma=0.3) ===
+generation 0: best=  287.4m mean=  247.9m worst=  147.3m
+generation 1: best=  287.4m mean=  250.8m worst=  205.6m
+generation 2: best=  287.4m mean=  217.6m worst=   24.7m
+generation 3: best=  287.4m mean=  209.0m worst=  134.2m
+generation 4: best=  287.4m mean=  188.4m worst=  -14.2m
+generation 5: best=  298.2m mean=  255.8m worst=  193.2m
+generation 6: best=  298.2m mean=  204.7m worst=   38.4m
+generation 7: best=  298.2m mean=  228.9m worst=  138.9m
+=== Phase 2: fine-tuning (sigma=0.08) ===
+generation 0: best=  298.2m mean=  287.6m worst=  277.5m
+generation 1: best=  298.2m mean=  283.6m worst=  270.7m
+generation 2: best=  298.2m mean=  283.8m worst=  260.3m
+generation 3: best=  298.2m mean=  285.5m worst=  257.4m
+generation 4: best=  298.2m mean=  290.4m worst=  284.3m
+generation 5: best=  298.2m mean=  285.7m worst=  272.2m
+------------------------------------------------------------------------
+best training fitness: 298.2m (seeds [13, 55, 110, 271, 997], 20s rounds)
+ReactiveParams(
+    center_offset_gain=0.09437765812661737,
+    heading_error_gain=0.05761283755797004,
+    lookahead_near_gain=0.09033539947299812,
+    lookahead_far_gain=0.05150093277359806,
+    wall_avoid_margin_m=0.9984770482614183,
+    wall_avoid_gain=0.33676478535712756,
+    emergency_front_m=2.500129543202483,
+    emergency_steer=0.8733926601175921,
+    recovery_steer=1.183216644687921,
+    recovery_throttle=-0.21430855823458606,
+    steer_limit=1.0,
+    turn_sharpness_deg=7.9347978275593345,
+    apex_bias_max_m=0.31137445196443336,
+    max_speed_mps=18.194525474628353,
+    speed_gain=0.33561427559043133,
+    corner_speed_gain=0.021591851522117442,
+    corner_signal_deg=41.85343568146501,
+    corner_yaw_rate_deg_per_s=49.77802577209076,
+    brake_lead_time_s=0.23534499772289047,
+    brake_min_distance_m=0.2620843869496009,
+    brake_gain=1.5356470476775665,
+    brake_quadratic_coeff=0.0,
+)
+------------------------------------------------------------------------
+diagnostic trace of the best params on the training seeds:
+=== seed 13: survived ===
+distance=288.2m laps=1 damage=0.00 max_speed=17.9m/s marshal=0x ticks=1200
+braking: 44/1200 ticks (3.7%) | front wall < 3m: 28/1200 ticks
+first contact at t=11.77s: speed=12.9m/s front=46.05m left=4.04m right=4.12m heading_error=-0.1 center_offset=0.04 -> throttle=-0.21 steer=1.18
+
+=== seed 55: survived ===
+distance=304.1m laps=1 damage=0.00 max_speed=17.9m/s marshal=0x ticks=1200
+braking: 25/1200 ticks (2.1%) | front wall < 3m: 14/1200 ticks
+first contact at t=12.33s: speed=12.5m/s front=8.39m left=6.68m right=2.06m heading_error=4.5 center_offset=-2.58 -> throttle=-0.21 steer=-1.18
+
+=== seed 110: survived ===
+distance=285.4m laps=1 damage=0.00 max_speed=17.9m/s marshal=0x ticks=1200
+braking: 67/1200 ticks (5.6%) | front wall < 3m: 26/1200 ticks
+first contact at t=12.33s: speed=17.5m/s front=37.54m left=4.06m right=4.10m heading_error=-0.1 center_offset=0.02 -> throttle=-0.21 steer=1.18
+
+=== seed 271: survived ===
+distance=308.9m laps=1 damage=0.00 max_speed=17.9m/s marshal=0x ticks=1200
+braking: 23/1200 ticks (1.9%) | front wall < 3m: 15/1200 ticks
+first contact at t=12.20s: speed=9.9m/s front=8.03m left=5.35m right=3.32m heading_error=9.9 center_offset=-1.25 -> throttle=-0.21 steer=-1.18
+
+=== seed 997: survived ===
+distance=304.6m laps=1 damage=0.00 max_speed=17.9m/s marshal=0x ticks=1200
+braking: 44/1200 ticks (3.7%) | front wall < 3m: 30/1200 ticks
+

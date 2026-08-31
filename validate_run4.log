@@ -1,0 +1,8 @@
+Overrides: {'center_offset_gain': 0.09437765812661737, 'heading_error_gain': 0.05761283755797004, 'lookahead_near_gain': 0.09033539947299812, 'lookahead_far_gain': 0.05150093277359806, 'wall_avoid_margin_m': 0.9984770482614183, 'wall_avoid_gain': 0.33676478535712756, 'emergency_front_m': 2.500129543202483, 'emergency_steer': 0.8733926601175921, 'recovery_steer': 1.183216644687921, 'recovery_throttle': -0.21430855823458606, 'steer_limit': 1.0, 'turn_sharpness_deg': 7.9347978275593345, 'apex_bias_max_m': 0.31137445196443336, 'max_speed_mps': 18.194525474628353, 'speed_gain': 0.33561427559043133, 'corner_speed_gain': 0.021591851522117442, 'corner_signal_deg': 41.85343568146501, 'corner_yaw_rate_deg_per_s': 49.77802577209076, 'brake_lead_time_s': 0.23534499772289047, 'brake_min_distance_m': 0.2620843869496009, 'brake_gain': 1.5356470476775665, 'brake_quadratic_coeff': 0.0}
+seed 42: survived 5/5, avg_dist=451.7m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 2027: survived 5/5, avg_dist=434.0m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 8675: survived 5/5, avg_dist=455.0m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 31415: survived 5/5, avg_dist=448.8m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+seed 777001: survived 5/5, avg_dist=435.2m, damages=[0.0, 0.0, 0.0, 0.0, 0.0]
+------------------------------------------------------------
+TOTAL: survived 25/25, avg_dist=444.9m, max_dist=475.9m
