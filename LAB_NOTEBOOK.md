@@ -9,10 +9,10 @@
 - AI coding agent (Claude Code) — read the simulator's sensor, physics, and scoring internals to ground design decisions in verified behavior, drafted the controller and evaluation script, ran the verification experiments, and proposed the parameter change based on the measured results.
 
 **Question or objective:**
-Can a hand-written reactive controller (explicit sensor→command rules with tunable parameters) drive the car around the full Mugello Short track and complete at least one lap within 30 seconds, from a random seeded starting position, without being destroyed (damage reaching 1.0)? This is the foundation for both our baseline and the parameter-optimization step that follows.
+Can a hand-written reactive controller (explicit sensor→command rules with tunable parameters) drive the car around the full track and complete at least one lap within 30 seconds, from a random seeded starting position, without being destroyed (damage reaching 1.0)? This is the foundation for both our baseline and the parameter-optimization step that follows.
 
 **What we investigated or changed:**
-- Read the simulator's public contract (`src/racing/student/api.py`, `SENSORS.md`) and internals (`race/sensors.py`, `race/progress.py`, `race/runtime.py`, `physics/engine.py`) to confirm sensor sign conventions, the lap-counting rule (cumulative forward progress since spawn crossing the track length — not a literal return to the start/finish line), and the damage model (wall-impact damage scales with the *square* of impact impulse; elimination at damage ≥ 1.0).
+- Read the simulator's public contract (`src/racing/student/api.py`, `SENSORS.md`) and internals (`race/sensors.py`, `race/progress.py`, `race/runtime.py`, `physics/engine.py`) to confirm sensor sign conventions, the lap-counting rule (cumulative forward progress since spawn crossing the track length — not a literal return to the start/finish line), and the damage model where car is eliminated at damage ≥ 1.0.
 - Measured track geometry directly: total closed-loop length ≈ 181.1 m, track width 6.6 m (~3.3 car-widths).
 - Implemented `src/controllers/reactive.py` — a parametrized controller (`ReactiveParams` dataclass) that steers using centerline offset, heading error, and near/far lookahead offsets; adds a proximity-based wall-avoidance term; brakes proportionally to a speed-scaled stopping distance against `wall_lidar.front_m`; and falls back to an open-side recovery maneuver on any contact.
 - Implemented `scripts/evaluate_controller.py` — a headless evaluation harness that races the controller against a passive baseline across seeded starting positions and reports scored distance, laps, damage, and marshal activity. This becomes the fitness function for the parameter-optimization stage.
@@ -120,3 +120,42 @@ Adopted the optimized parameter set as the new `DEFAULT_PARAMS`. The evidence (2
 - Try a larger search budget (more generations/population) now that a single search run took under 3 minutes wall-clock, to see if further gains are available.
 - Investigate whether `steer_limit` settling at 0.63 (well below 1.0) indicates the car is leaving speed on the table in the sharpest turns; consider whether a track-position-aware `apex_bias_max_m` (larger in sharper, slower corners) would help.
 - This result is now the baseline to beat for the "Select and Refine" stage; compare any future controller (including a re-attempted, better-budgeted neuroevolution run) against this ~435 m figure, not the original 229 m.
+
+## Entry 4 — Failed Attempt: Anticipatory Apex Bias + Higher-Speed Search (Reverted)
+
+**Date and time:** August 31, 2026
+
+**Participants and contributions:**
+- Leon Aaron — requested the specific behavior (drive straight through small chicanes, hug the inside of turns harder, target ~2x distance) and, after reviewing the risky validation numbers, called for reverting to the known-good Entry 3 state and asked for manual tuning guidance instead of further automated search.
+- [Add teammate name and contribution here.]
+- AI coding agent (Claude Code) — implemented the redesign, ran two search attempts, diagnosed why each was unsafe, and performed the revert.
+
+**Question or objective:**
+Could the reactive controller reach roughly double Entry 3's distance (~435 m → ~870 m) by (1) making the apex-bias steering anticipatory — driven by the farthest camera lookahead point (~16 m ahead) instead of instantaneous heading error, so a brief chicane nets out straight while a sustained turn still gets the full inside-hugging bias — and (2) searching a wider parameter range, including a much higher `max_speed_mps`?
+
+**What we investigated or changed:**
+- Verified the track geometry directly (segment headings from `MUGELLO_SHORT_LAYOUT`): confirmed a ~49-unit straight at the start and exactly two sharp right-hand turns (~50–52°, near "Luco climb" and "Materassi exit"), each in an otherwise left-trending section — consistent with what was reported by observation.
+- Replaced the heading-error-driven apex bias with a lookahead-driven one (`lookahead_offsets_m[-1]`), and manually raised `max_speed_mps` to 20.0 and `apex_bias_max_m` to 1.2 as a search starting point.
+- Ran a parameter search (population 12, generations 14, seeds 13 & 55, 20-second rounds): training fitness reached 314 m, but the trace showed **real, non-zero damage (0.27–0.41) on both training seeds** — the fitness function only penalized full elimination (damage ≥ 1.0), never partial damage, so it rewarded a genome that clips walls hard but happens not to fully break in a short training round.
+- Validated that genome on the full held-out suite anyway: **10/25 survived**, with damage = 1.0 (full elimination) in most of the losses — confirming the fitness gap was real, not a fluke.
+- Fixed the fitness function (`scripts/optimize_reactive.py`) to subtract a penalty proportional to non-fatal damage, not just elimination, and reran the search with the same budget.
+- The corrected search converged to `max_speed_mps ≈ 19.1` with small training damage (0.06–0.11). Validated on the held-out suite: **19/25 survived, average distance 399.7 m** — safer than the first attempt, but still worse on both counts than Entry 3's 25/25-survived, 435 m result.
+
+**Evidence:**
+- AI-agent assistance: Claude Code ran both search attempts in the background, diagnosed the fitness-function gap from the trace output (not a guess — the 0.27–0.41 training damage was visible before validation confirmed the consequence), and reverted the shipped controller only after the second attempt also underperformed the known-good baseline.
+- Commits or code: `scripts/optimize_reactive.py` retains the damage-penalty fix (a genuine correctness improvement, kept); `src/controllers/reactive.py` was reverted to the exact Entry 3 state and re-verified.
+- Experiment output: two full background search runs (population 12, generations 14, seeds 13 & 55, 20s rounds; ~13–15 min wall-clock each) plus held-out validation runs (5 seeds × 5 races × 30s) after each.
+- Leaderboard result: not applicable.
+
+**What we observed:**
+- Both search attempts found genomes that looked good on their two training seeds but generalized worse than the existing baseline on the held-out suite — the same "training seed(s) don't cover the whole risk surface" failure pattern seen with neuroevolution in Entry 2, now reproduced in the reactive-controller search too.
+- Fixing the fitness function (penalizing damage, not just elimination) measurably reduced training-time recklessness (0.27–0.41 damage → 0.06–0.11 damage) but was still not enough alone to beat the existing 435 m/0-damage baseline within this search budget.
+- Average distance is not a safe stand-in for "twice as fast without being destroyed": both search attempts had *higher peak per-race distances* (up to 456 m) than Entry 3, but lower *average* distance once eliminations are included, and violated the hard "not destroyed" requirement on a meaningful fraction of races.
+
+**Decision and rationale:**
+Reverted `src/controllers/reactive.py` to the exact Entry 3 parameter set (25/25 survived, 0.00 damage, ~435 m) rather than keep either riskier result. Two training seeds with a 20-second round appears to be too small a sample of this track's risk surface for this search budget to reliably find a genuinely safer-and-faster optimum — the search kept discovering the same trade-off (more speed, more wall contact) without enough pressure to escape it. Manual, incremental tuning — changing one parameter at a time and validating against all 5 held-out seeds after each change — is the next step, so a human can catch a "looks great on training seeds, fails on held-out seeds" result immediately rather than trusting one aggregate fitness number.
+
+**Next steps:**
+- Manually probe the safe ceiling of `max_speed_mps` in small increments from the Entry 3 baseline, validating on all 5 seeds after each change (see the guidance given directly to the team for this).
+- If returning to automated search, use 3+ training seeds instead of 2, and/or increase the damage penalty scale further, before trusting a search result over Entry 3's baseline.
+- Consider the lookahead-driven anticipatory apex bias again later — the idea itself was not disproven, it was just tested simultaneously with a large, uncontrolled speed increase, which makes it impossible to tell which change caused the damage.

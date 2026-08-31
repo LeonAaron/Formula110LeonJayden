@@ -8,10 +8,13 @@ struggles in LAB_NOTEBOOK.md, Entry 2). Each parameter is perturbed by noise
 scaled to its own magnitude, so one shared step size works across gains,
 angles, and distances of very different scale.
 
-Fitness: same three-tier shape used for the neuroevolution trainer (distance,
-minus a large penalty on elimination, minus a small penalty for going
-nowhere), so a genome cannot out-score a safe driver just by crashing fast, or
-out-score a real driver just by idling.
+Fitness: distance, minus a large penalty on elimination, minus a small
+penalty for going nowhere, minus a penalty proportional to non-fatal damage.
+The damage term matters: an earlier version only penalized full elimination,
+and the search found a genome that clipped walls hard on every corner but
+technically survived its short training rounds, then got eliminated in most
+held-out validation races. Penalizing damage directly (not just death)
+closed that gap.
 
 Diagnostics: --diagnose reruns one race with full per-tick tracing (sensors +
 command) and prints, in order:
@@ -42,6 +45,7 @@ from racing import HeadToHeadTeamRaceStats, RobotCommand, RobotSensors, run_head
 ELIMINATION_PENALTY_M = 350.0
 IDLE_DISTANCE_M = 10.0
 IDLE_PENALTY_M = 20.0
+DAMAGE_PENALTY_SCALE_M = 300.0
 
 PARAM_NAMES: tuple[str, ...] = tuple(field.name for field in fields(ReactiveParams))
 Genome = tuple[float, ...]
@@ -93,13 +97,19 @@ def evaluate_params(params: ReactiveParams, *, seeds: tuple[int, ...], round_sec
         )
         stats = result.races[0].challenger
         distance_m = stats.distances_m[0]
-        eliminated = stats.damages[0] >= 1.0
+        damage = stats.damages[0]
+        eliminated = damage >= 1.0
         if eliminated:
             race_scores.append(distance_m - ELIMINATION_PENALTY_M)
         elif distance_m < IDLE_DISTANCE_M:
             race_scores.append(distance_m - IDLE_PENALTY_M)
         else:
-            race_scores.append(distance_m)
+            # Penalize non-fatal damage too, not just full elimination — an
+            # earlier version only penalized elimination and evolution found
+            # a genome that clipped walls hard on every corner, surviving its
+            # short training rounds but getting eliminated in most held-out
+            # validation races. See LAB_NOTEBOOK.md, Entry 4.
+            race_scores.append(distance_m - DAMAGE_PENALTY_SCALE_M * damage)
     return mean(race_scores)
 
 

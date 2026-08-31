@@ -1,4 +1,3 @@
-
 """Reactive rule-based controller: sensor-driven throttle and steering.
 
 All tunable gains and thresholds live in ``ReactiveParams`` so a future
@@ -37,6 +36,8 @@ class ReactiveParams:
 
     Defaults are the result of scripts/optimize_reactive.py (evolution
     strategy, seeded from a hand-tuned baseline). See LAB_NOTEBOOK.md, Entry 3.
+    Validated: 25/25 survived, 25/25 completed >=1 lap, 0.00 damage in every
+    race across the seed suite (42, 110, 271, 997, 2027), avg. ~435 m/30s.
     """
 
     # Steering: follow the track centerline and upcoming curvature.
