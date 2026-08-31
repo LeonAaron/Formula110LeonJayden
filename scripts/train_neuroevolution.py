@@ -100,7 +100,7 @@ def main() -> None:
         "--seeds",
         type=int,
         nargs="+",
-        default=[13, 55],
+        default=[13, 55, 7, 89, 233],
         help="Training seeds, kept distinct from the held-out evaluation suite",
     )
     parser.add_argument("--round-seconds", type=float, default=20.0)

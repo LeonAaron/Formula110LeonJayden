@@ -38,7 +38,7 @@ Files: `src/controllers/reactive.py`, `scripts/evaluate_controller.py`, `scripts
 
 **Evaluation:** Trained on seeds distinct from the recommended suite (fast, 20-second rounds); validated on the held-out suite `(42, 110, 271, 997, 2027)`, 5 races per seed, 30-second rounds — identical protocol to Approach 1 for a direct comparison.
 
-**Status: implemented and trained; not yet reliable.** Four training runs were needed to understand the fitness landscape, each revealing a distinct failure mode:
+**Status: implemented and trained; now reliable.** Five training runs were needed to understand the fitness landscape, each revealing a distinct failure mode:
 
 | Attempt | Fitness design | Training result | Held-out validation (25 races) |
 | --- | --- | --- | --- |
@@ -46,17 +46,18 @@ Files: `src/controllers/reactive.py`, `scripts/evaluate_controller.py`, `scripts
 | 2 | Distance replaced by fixed −50 if eliminated (survival-only) | Converged to 63 m | 20/25 survived, **0/25 laps**, ~0 m avg — discovered that standing still is a free, zero-risk "safe" strategy |
 | 3 | Distance − 350 if eliminated, − 20 if idle (< 10 m) | Converged to 260 m (single training seed) | 8/25 survived, 21/25 laps — fast (28–35 m/s) and usually completes a lap, but still crashes in most races |
 | 4 | Same fitness as #3, trained on two seeds instead of one | Converged to 53 m | Reproduced attempt #2's idle genome exactly — the wider requirement (safe on two starting points) overwhelmed this population/generation budget |
+| 5 | Same fitness as #3/#4, trained on **five** seeds, with population/generations scaled up (10→20, 6→15) to match the harder objective | First tried at the old population/generations budget: converged to only 8.8 m — confirmed seed count alone made the problem harder without more search capacity to solve it. Rerun at population 20 / generations 15: converged to 235.8 m | **24/25 survived, 25/25 laps**, avg scored distance **356.0 m**, max speed 28.9 m/s — the first neuroevolution genome that generalizes across the held-out suite instead of overfitting to one or two training starts |
 
-Attempt 3's genome is kept as `BEST_GENOME` in `src/controllers/neuro.py` — it is the most genuinely "racing" result, even though unreliable.
+Attempt 5's genome is now `BEST_GENOME` in `src/controllers/neuro.py`, replacing attempt 3's — it is both the fastest-converging *and* the most reliable neuroevolution result so far.
 
-| Metric | Result (Attempt 3, held-out suite) |
+| Metric | Result (Attempt 5, held-out suite) |
 | --- | --- |
-| Survival rate | 8/25 races |
-| Lap-completion rate | 21/25 races |
-| Avg. scored distance | ~187–288 m per seed |
-| Max speed reached | 28–35 m/s (2–2.5× the reactive controller's 13.9 m/s) |
-| Development effort | High — four training iterations, each requiring a fitness-function diagnosis |
-| Remaining risk | Fitness shaping is unresolved; this minimal (mu+lambda) search has not found a genome that is both fast and consistently safe |
+| Survival rate | 24/25 races |
+| Lap-completion rate | 25/25 races |
+| Avg. scored distance | 356.0 m |
+| Max speed reached | 28.9 m/s (~1.8× the reactive controller's 15.7 m/s) |
+| Development effort | High — five training iterations total, plus a within-attempt lesson that seed count and search budget must scale together |
+| Remaining risk | One held-out race still ended in elimination (damage 1.00, seed 997) — not yet a perfect safety record; fitness still uses the mean across training seeds, so an outlier-punishing (e.g. worst-case or spread-penalized) objective is untried |
 
 Files: `src/controllers/neuro.py`, `scripts/train_neuroevolution.py`.
 
@@ -64,12 +65,12 @@ Files: `src/controllers/neuro.py`, `scripts/train_neuroevolution.py`.
 
 | | Approach 1: Reactive (optimized) | Approach 2: Neuroevolution |
 | --- | --- | --- |
-| Survival rate (held-out suite) | 25/25 | 8/25 |
-| Lap-completion rate | 25/25 (2 laps each) | 21/25 (1 lap) |
-| Avg. scored distance | ~435 m | ~187–288 m per seed |
-| Max speed | 15.7 m/s | 28–35 m/s |
-| Development effort | Low-to-moderate — one redesign pass, one ~3-minute search run | High — four training iterations to diagnose reward shaping |
+| Survival rate (held-out suite) | 25/25 | 24/25 |
+| Lap-completion rate | 25/25 (2 laps each) | 25/25 (1–2 laps) |
+| Avg. scored distance | ~435 m | 356.0 m |
+| Max speed | 15.7 m/s | 28.9 m/s |
+| Development effort | Low-to-moderate — one redesign pass, one ~3-minute search run | High — five training iterations to diagnose reward shaping and search-budget scaling |
 | Interpretability | High (readable rules) | Low (opaque weights) |
-| Remaining risk | `steer_limit` below max suggests unclaimed speed in sharp corners | Unresolved fitness shaping; no genome yet found that is both fast and reliably safe |
+| Remaining risk | `steer_limit` below max suggests unclaimed speed in sharp corners | One held-out elimination remains; fitness still averages across seeds rather than penalizing the worst one |
 
-**Reading the evidence:** Approach 1 now leads on every metric that matters except raw top speed — it covers more distance overall (435 m vs. Approach 2's best-case ~290 m) *and* does so with perfect reliability. Approach 2's neuroevolution still demonstrates a materially higher physical speed ceiling (28–35 m/s vs. 15.7 m/s) that Approach 1 has not reached, but it has not converged on a policy that is also safe. Both approaches improved via the same lesson — seed a search from a known-good baseline rather than random initialization — which explains why Approach 1's search converged smoothly (worst-of-generation was never catastrophic) while Approach 2's random-init runs repeatedly found degenerate optima. This is decisive evidence for selecting **Approach 1 as the primary controller**. Approach 2's speed ceiling remains motivation for the hybrid idea noted earlier: let a learned component chase Approach 2's demonstrated top speed under Approach 1's safety floor.
+**Reading the evidence:** Approach 1 still leads on survival, lap completion, and average distance, but the gap has closed substantially since attempt 5 — Approach 2 now survives 24/25 held-out races (up from 8/25) and completes a lap in all 25, while still holding a ~1.8× top-speed advantage (28.9 m/s vs. 15.7 m/s). The decisive lesson from attempt 5 was that Approach 2's earlier failures were as much a *search-budget* problem as a *fitness-design* problem: requiring generalization across 5 seeds only worked once population and generations were scaled up to match the harder objective — at the old budget, more seeds made results strictly worse (235.8 m final fitness vs. 8.8 m). Both approaches also share an older lesson — seed a search from a known-good baseline rather than random initialization — which is likely why Approach 1's search has never hit a degenerate optimum the way Approach 2's random-init runs originally did. Approach 1 remains the safer default given its perfect record, but Approach 2 is no longer clearly worse overall — it is a live candidate, and the remaining gap (one elimination, lower average distance) is a narrower, more specific problem than it was before attempt 5.

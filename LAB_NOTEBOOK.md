@@ -159,3 +159,44 @@ Reverted `src/controllers/reactive.py` to the exact Entry 3 parameter set (25/25
 - Manually probe the safe ceiling of `max_speed_mps` in small increments from the Entry 3 baseline, validating on all 5 seeds after each change (see the guidance given directly to the team for this).
 - If returning to automated search, use 3+ training seeds instead of 2, and/or increase the damage penalty scale further, before trusting a search result over Entry 3's baseline.
 - Consider the lookahead-driven anticipatory apex bias again later — the idea itself was not disproven, it was just tested simultaneously with a large, uncontrolled speed increase, which makes it impossible to tell which change caused the damage.
+
+## Entry 5 — Neuroevolution: Five Training Seeds at a Scaled-Up Search Budget
+
+**Date and time:** August 31, 2026 (continued)
+
+**Participants and contributions:**
+- Jayden Webb — proposed widening Entry 2's training seed count from two to five to directly target the cross-seed generalization failure, directed the sequencing of the experiment (change seed count first, observe, only then scale population/generations rather than changing both at once), requested held-out validation against the actual suite before trusting the training curve, watched the resulting genome race live, and directed the genome swap and this documentation update.
+- [Add teammate name and contribution here.]
+- AI coding agent (Claude Code) — implemented the seed-count change in `scripts/train_neuroevolution.py`, ran both training passes (unscaled and scaled budget), diagnosed why the first regressed, wrote a standalone held-out validation script, ran the graphical head-to-head to confirm the result visually, and performed the `BEST_GENOME` swap plus this entry and the `EXPLORATION.md` update.
+
+**Question or objective:**
+Entry 2 showed that training on more seeds (attempt 4, two seeds) made results *worse*, not better, collapsing to the same degenerate idle genome as the single-objective survival-only attempt. Was that because more training seeds are fundamentally the wrong lever, or because the population/generation budget (10 genomes, 6–8 generations) was already too small for two seeds and got asked to solve an even harder problem without more capacity? Concretely: does five-seed training, given a search budget scaled to match, produce a genome that survives the *held-out* suite — the specific failure every prior attempt shared — without giving up neuroevolution's speed advantage?
+
+**What we investigated or changed:**
+- Changed `scripts/train_neuroevolution.py`'s `--seeds` default from `[13, 55]` to `[13, 55, 7, 89, 233]` — five seeds, still kept distinct from the held-out validation suite `(42, 110, 271, 997, 2027)`.
+- Ran training at the unchanged default budget (population 10, generations 6) first, deliberately, to isolate the effect of the seed-count change alone before touching anything else: **best training fitness converged to only 8.8 m**, with the `worst`-of-generation column pinned near the full −350 elimination penalty in every generation — confirming the same population could not satisfy five seeds' worth of requirement at all, let alone generalize.
+- Reran with population and generations both scaled up (10→20, 6→15) to match the harder five-seed objective: **best training fitness converged to 235.8 m** by generation 9 and held there. The `worst` column still touched −350 in the final generation, showing the population was not uniformly safe even though its best genome was.
+- Validated the resulting genome on the full held-out suite with a standalone script (not the shipped `controllers.neuro`, to avoid touching `BEST_GENOME` before the result was confirmed): `run_headless_head_to_head` against a passive baseline, all five held-out seeds, five races each (25 total), 30-second rounds — identical protocol to every other attempt.
+- Watched the validated genome race live (`uv run racing h2h --watch`) against `controllers.reactive` (seed 110) to visually confirm the driving behavior before committing to the swap.
+- Swapped the new genome into `BEST_GENOME` in `src/controllers/neuro.py` and re-ran `scripts/evaluate_controller.py --module controllers.neuro` on a held-out seed to confirm the shipped controller now reproduces the validation script's numbers exactly.
+
+**Evidence:**
+- Sources or documentation: none new; built on Entry 2's fitness-function design (unchanged three-tier scoring) and Entry 3/4's lesson about training-seed coverage vs. search budget.
+- AI-agent assistance: Claude Code ran both training passes in the background, read the raw generation-by-generation output to diagnose the first pass's failure before proposing the budget increase, and wrote/ran the held-out validation independently of the training script so the result wasn't self-reported by the same code path that produced it.
+- Commits or code: `scripts/train_neuroevolution.py` (seed default), `src/controllers/neuro.py` (`BEST_GENOME` replaced).
+- Experiment output: `uv run python scripts/train_neuroevolution.py` (unscaled budget, regressed) and `uv run python scripts/train_neuroevolution.py --population 20 --generations 15` (scaled budget, converged); held-out validation via `run_headless_head_to_head` across `(42, 110, 271, 997, 2027)`, 5 races/seed; confirmation run via `uv run python scripts/evaluate_controller.py --module controllers.neuro --seed 42 --races 2 --round-seconds 30`.
+- Leaderboard result: not applicable — local evaluation only.
+
+**What we observed:**
+- Widening the training objective (more seeds) and widening the search's capacity to solve it (more population/generations) are not independent levers — increasing seed count alone, at Entry 2's original budget, made the outcome strictly worse (8.8 m vs. attempt 4's already-poor 53 m), reproducing the same kind of collapse for a harder reason.
+- Once budget was scaled to match, the held-out result was the best of any neuroevolution attempt so far: **24/25 survived, 25/25 completed ≥1 lap, avg scored distance 356.0 m, max speed 28.9 m/s** — compared to attempt 3's 8/25 survived, 21/25 laps, ~187–288 m avg.
+- The one held-out failure (seed 997, race 4: eliminated, damage 1.00) shows the fix is not complete — the fitness function still scores a genome by the *mean* across its five training seeds, so a genome that is excellent on four and fails on one can still average well. This matches the exact risk discussed before running the experiment.
+- This result closes most, but not all, of the gap to Approach 1 (25/25 survived, 435 m) while keeping neuroevolution's ~1.8× top-speed advantage (28.9 m/s vs. 15.7 m/s), materially changing the recommendation in `EXPLORATION.md`'s comparison section from "Approach 1 dominates" to "Approach 1 is safer, Approach 2 is a live candidate."
+
+**Decision and rationale:**
+Replaced attempt 3's genome with this one as `BEST_GENOME` in `src/controllers/neuro.py`, and updated `EXPLORATION.md`'s Approach 2 section and comparison table to reflect the new numbers. This is a clear improvement on every held-out metric simultaneously (survival, laps, and distance all rose; speed did not have to be sacrificed to get there), unlike prior attempts which always traded one property for another.
+
+**Next steps:**
+- The remaining single held-out elimination suggests the mean-across-seeds fitness is still the limiting factor, not search budget — try scoring by the worst-of-seeds result (or a mean-minus-spread penalty) instead of the plain mean, now that the budget is large enough to make that harder objective tractable.
+- Consider increasing training seeds beyond five and/or adding more elites, now that a population-20/generation-15 run completes in well under 15 minutes.
+- Re-run Approach 1 vs. Approach 2 selection reasoning now that the gap has narrowed substantially — this may no longer be a clear-cut "pick Approach 1" decision by the time of the "Select and Refine" stage.
