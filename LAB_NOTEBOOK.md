@@ -45,7 +45,6 @@ Adopted the `max_speed_mps = 14.0`, `corner_heading_error_deg = 50.0` configurat
 
 **Participants and contributions:**
 - Leon Aaron and Jayden Webb — reviewed each training result, decided when to change the fitness function vs. accept a result, and directed the scope of the experiment.
-- [Add teammate name and contribution here.]
 - AI coding agent (Claude Code) — implemented the network, feature encoding, and evolution-strategy trainer; ran four training iterations; diagnosed each failure mode from the printed generation-by-generation fitness and held-out validation output; proposed and implemented each fitness-function fix.
 
 **Question or objective:**
@@ -86,7 +85,6 @@ Kept attempt 3's genome as `BEST_GENOME` in `src/controllers/neuro.py` — it is
 
 **Participants and contributions:**
 - Leon Aaron — proposed the specific behavioral changes (no proactive braking, infer turn sharpness from sensors, hug the inside of a turn), reviewed each result, and directed the scope of the optimization run.
-- [Add teammate name and contribution here.]
 - AI coding agent (Claude Code) — implemented the apex-hugging steering and no-proactive-braking redesign, built the parameter-search script and its diagnostic tracing, ran the search, and validated the result.
 
 **Question or objective:**
@@ -205,7 +203,6 @@ Replaced attempt 3's genome with this one as `BEST_GENOME` in `src/controllers/n
 
 **Participants and contributions:**
 - Leon Aaron — directed the experiment loop (inspect → modify → optimize → validate → diagnose), specified the train/validation seed split, and required one-variable-at-a-time testing before trusting any automated search result.
-- [Add teammate name and contribution here.]
 - AI coding agent (Claude Code) — added the new tunable mechanisms, ran every isolated A/B test, diagnosed the counterintuitive results, and added parameter bounds plus a two-phase search to `scripts/optimize_reactive.py`.
 
 **Question or objective:**
