@@ -234,7 +234,39 @@ Concluded that manual single-variable A/B testing has reached its limit here —
 - Validate any search result against the full, disjoint validation set `(42, 2027, 8675, 31415, 777001)` before accepting it, exactly as required this time.
 - If the search cannot beat 432.5 m either, that is itself a meaningful, reportable conclusion: this parameterization of the reactive controller may be near its practical ceiling on this track without a further architectural change (e.g. the anticipatory lookahead-based apex bias from Entry 4, tested in isolation this time rather than simultaneously with a speed increase).
 
-## Entry 7 — reactive2.py: New Sensor Mechanisms, Worst-Seed Search, Rejected on Validation
+## Entry 7 — Neuroevolution: Wider Population Closes the Last Held-Out Elimination
+
+**Date and time:** August 31, 2026 (continued)
+
+**Participants and contributions:**
+- Jayden Webb — directed the experiment (widen population/generations rather than change the fitness function again), and set the rule for this entry: only update `BEST_GENOME` and this notebook if the result beats Entry 5, otherwise keep the shipped genome and just report back.
+- [Add teammate name and contribution here.]
+- AI coding agent (Claude Code) — ran the training pass, validated it independently on the held-out suite, and (separately) tested a same-budget sensor-encoding change that regressed and was reverted before this attempt.
+
+**Question or objective:**
+Entry 5's best fitness (235.8 m) was flat across its final 5 generations — a sign the search had exhausted what a population of 20 could find, not necessarily what the objective allows. Would widening the population (20→40) and elite count (2→3), with everything else unchanged, find a genome that beats Entry 5 on both distance and the one remaining held-out elimination (seed 997)?
+
+**What we investigated or changed:**
+- Ran `scripts/train_neuroevolution.py --population 40 --generations 15 --elite 3` on the unchanged Entry 5 fitness function and seeds `(13, 55, 7, 89, 233)`. Best training fitness reached 249.8 m, still rising through generation 11 before leveling off — unlike Entry 5's harder plateau.
+- Validated the result independently against the full held-out suite `(42, 110, 271, 997, 2027)`, 5 races/seed, before touching `BEST_GENOME`.
+- (Separately, in between Entry 5 and this run: tried raising `SPEED_CAP_MPS` from 15 to 35 in `neuro.py`'s input normalization, at Entry 5's original population/generations budget, hypothesizing the network was "blind" to its own speed above 15 m/s. This regressed to 282.2 m avg. and was reverted — evidence that a harder-to-use, less-saturated input signal needs more search budget than a coarser one, not less, consistent with this entry's population-budget finding.)
+
+**Evidence:**
+- Experiment output: `uv run python scripts/train_neuroevolution.py --population 40 --generations 15 --elite 3`; held-out validation via `run_headless_head_to_head`, same protocol as Entry 5; confirmation via `uv run python scripts/evaluate_controller.py --module controllers.neuro --seed 42 --races 2 --round-seconds 30`.
+- Commits or code: `src/controllers/neuro.py` (`BEST_GENOME` replaced).
+
+**What we observed:**
+Held-out result beat Entry 5 on every metric: **25/25 survived** (up from 24/25 — closes the seed-997 elimination), **25/25 laps**, avg scored distance **371.1 m** (up from 356.0 m), max speed 28.1 m/s. No tradeoff this time — unlike every earlier attempt, nothing got worse to get this improvement.
+
+**Decision and rationale:**
+Beats Entry 5 outright, so per the standing rule: replaced Entry 5's genome with this one as `BEST_GENOME` in `src/controllers/neuro.py`, and updated `EXPLORATION.md`'s Approach 2 section and comparison table accordingly.
+
+**Next steps:**
+- The mean-across-seeds fitness function is still unchanged; this result reached 25/25 without that fix, so the worst-case/spread-penalty idea from Entry 5 is no longer urgent but remains untested as a possible further gain.
+- Population 40 took noticeably longer than population 20 (roughly double, as expected); a next attempt should check whether the plateau pattern repeats before investing in an even larger population.
+
+
+## Entry 8 — reactive2.py: New Sensor Mechanisms, Worst-Seed Search, Rejected on Validation
 
 **Date and time:** September 2, 2026
 
@@ -280,7 +312,7 @@ Can genuinely new sensor signals — ones `reactive.py` never reads (forward/lat
 - The `--workers` multiprocessing fix (`ProcessPoolExecutor` across the population, `--workers -1` to use all logical cores) cut this search's wall-clock time from an estimated ~35–45 minutes to well under that on a 14-core machine; it carries forward to any future `optimize_reactive2.py` run regardless of whether this particular mechanism set is revisited, and should be the default going forward rather than the sequential path.
 - A structurally different next attempt worth considering: train a small PyTorch model (e.g. a compact MLP policy, in the spirit of Entry 2's neuroevolution strategy but gradient-trained via imitation or RL rather than evolution-searched) directly on the full sensor vector, rather than continuing to hand-design more gated mechanisms on top of a fixed reactive control law. This could let the model discover nonlinear sensor combinations (e.g. a learned fusion of the corner-severity signals that Entry 7 deliberately kept hand-separated) that a human-authored formula is unlikely to find, at the cost of losing the interpretability that made every entry in this notebook diagnosable.
 
-## Entry 8 — reactive2.py Re-Search with a Safety-Margin Floor: Damage Fixed, Gain Erased
+## Entry 9 — reactive2.py Re-Search with a Safety-Margin Floor: Damage Fixed, Gain Erased
 
 **Date and time:** September 2, 2026 (continued)
 
@@ -313,33 +345,3 @@ Entry 7's rejected candidate had a real ~2-3% distance gain (454.1 m mean) under
 - The PyTorch-model direction from Entry 7 remains the most promising path for a real step-change, since it does not depend on a human first guessing which hand-designed mechanism might help.
 - Keep the `--workers` multiprocessing default for any future `optimize_reactive2.py` run — both re-runs in this investigation benefited from it, and it is what made a same-day two-attempt turnaround (Entry 7 then Entry 8) practical at all.
 
-## Entry 7 — Neuroevolution: Wider Population Closes the Last Held-Out Elimination
-
-**Date and time:** August 31, 2026 (continued)
-
-**Participants and contributions:**
-- Jayden Webb — directed the experiment (widen population/generations rather than change the fitness function again), and set the rule for this entry: only update `BEST_GENOME` and this notebook if the result beats Entry 5, otherwise keep the shipped genome and just report back.
-- [Add teammate name and contribution here.]
-- AI coding agent (Claude Code) — ran the training pass, validated it independently on the held-out suite, and (separately) tested a same-budget sensor-encoding change that regressed and was reverted before this attempt.
-
-**Question or objective:**
-Entry 5's best fitness (235.8 m) was flat across its final 5 generations — a sign the search had exhausted what a population of 20 could find, not necessarily what the objective allows. Would widening the population (20→40) and elite count (2→3), with everything else unchanged, find a genome that beats Entry 5 on both distance and the one remaining held-out elimination (seed 997)?
-
-**What we investigated or changed:**
-- Ran `scripts/train_neuroevolution.py --population 40 --generations 15 --elite 3` on the unchanged Entry 5 fitness function and seeds `(13, 55, 7, 89, 233)`. Best training fitness reached 249.8 m, still rising through generation 11 before leveling off — unlike Entry 5's harder plateau.
-- Validated the result independently against the full held-out suite `(42, 110, 271, 997, 2027)`, 5 races/seed, before touching `BEST_GENOME`.
-- (Separately, in between Entry 5 and this run: tried raising `SPEED_CAP_MPS` from 15 to 35 in `neuro.py`'s input normalization, at Entry 5's original population/generations budget, hypothesizing the network was "blind" to its own speed above 15 m/s. This regressed to 282.2 m avg. and was reverted — evidence that a harder-to-use, less-saturated input signal needs more search budget than a coarser one, not less, consistent with this entry's population-budget finding.)
-
-**Evidence:**
-- Experiment output: `uv run python scripts/train_neuroevolution.py --population 40 --generations 15 --elite 3`; held-out validation via `run_headless_head_to_head`, same protocol as Entry 5; confirmation via `uv run python scripts/evaluate_controller.py --module controllers.neuro --seed 42 --races 2 --round-seconds 30`.
-- Commits or code: `src/controllers/neuro.py` (`BEST_GENOME` replaced).
-
-**What we observed:**
-Held-out result beat Entry 5 on every metric: **25/25 survived** (up from 24/25 — closes the seed-997 elimination), **25/25 laps**, avg scored distance **371.1 m** (up from 356.0 m), max speed 28.1 m/s. No tradeoff this time — unlike every earlier attempt, nothing got worse to get this improvement.
-
-**Decision and rationale:**
-Beats Entry 5 outright, so per the standing rule: replaced Entry 5's genome with this one as `BEST_GENOME` in `src/controllers/neuro.py`, and updated `EXPLORATION.md`'s Approach 2 section and comparison table accordingly.
-
-**Next steps:**
-- The mean-across-seeds fitness function is still unchanged; this result reached 25/25 without that fix, so the worst-case/spread-penalty idea from Entry 5 is no longer urgent but remains untested as a possible further gain.
-- Population 40 took noticeably longer than population 20 (roughly double, as expected); a next attempt should check whether the plateau pattern repeats before investing in an even larger population.
