@@ -1,4 +1,4 @@
-"""Parameter-search and diagnostic tool for controllers.reactive.ReactiveParams.
+"""Parameter-search and diagnostic tool for controllers.reactive2.ReactiveParams.
 
 Optimization: a simple (mu + lambda) evolution strategy, seeded from the
 current DEFAULT_PARAMS (a known-safe baseline) rather than random init, since
@@ -8,18 +8,28 @@ struggles in LAB_NOTEBOOK.md, Entry 2). Each parameter is perturbed by noise
 scaled to its own magnitude, so one shared step size works across gains,
 angles, and distances of very different scale.
 
-Fitness: distance, minus a large penalty on elimination, minus a small
-penalty for going nowhere, minus a penalty proportional to non-fatal damage.
-The damage term matters: an earlier version only penalized full elimination,
-and the search found a genome that clipped walls hard on every corner but
-technically survived its short training rounds, then got eliminated in most
-held-out validation races. Penalizing damage directly (not just death)
-closed that gap.
+Fitness: a blend of the mean and the worst per-seed score (see
+WORST_SEED_PENALTY_WEIGHT below), where each per-seed score is distance minus
+a large penalty on elimination, minus a small penalty for going nowhere,
+minus a penalty proportional to non-fatal damage. The damage term matters: an
+earlier version only penalized full elimination, and the search found a
+genome that clipped walls hard on every corner but technically survived its
+short training rounds, then got eliminated in most held-out validation races.
+Penalizing damage directly (not just death) closed that gap. The worst-seed
+blend addresses a related, later-discovered gap (LAB_NOTEBOOK.md, Entry 5):
+averaging across seeds can still let a genome that's excellent on most seeds
+and eliminated on one look good on average — blending in the worst seed's
+score pushes the search toward genomes that are safe on every seed, not just
+safe on average, without going as far as pure worst-case fitness (which risks
+collapsing the search to a degenerate idle optimum, as also seen in Entry 2).
 
 Diagnostics: --diagnose reruns one race with full per-tick tracing (sensors +
-command) and prints, in order:
+command, including reactive2.py's new sensor signals: lateral/forward
+acceleration, the raw diagonal wall-lidar beams, roll/pitch, the curvature
+signal, and whether the instability override fired) and prints, in order:
   - a summary (distance, laps, damage, marshal activity, max speed)
   - how often the car braked and how close it got to walls
+  - how often the new reactive2.py mechanisms were active
   - the sensor/command state at the moment of first wall contact, if any
   - the last several ticks before the race ended, if the car was eliminated
 
@@ -28,15 +38,18 @@ concrete sensor values, the throttle/steer output, and the simulated time at
 which the event happened - not just a fitness number.
 
 Usage:
-    uv run python scripts/optimize_reactive2.py --population 10 --generations 10
+    uv run python scripts/optimize_reactive2.py --population 20 --generations 18 --phase2-generations 10
     uv run python scripts/optimize_reactive2.py --diagnose --seed 110
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import fields, replace
+from functools import partial
 from statistics import mean
 
 from controllers.reactive2 import DEFAULT_PARAMS, ReactiveParams, drive
@@ -46,6 +59,15 @@ ELIMINATION_PENALTY_M = 350.0
 IDLE_DISTANCE_M = 10.0
 IDLE_PENALTY_M = 20.0
 DAMAGE_PENALTY_SCALE_M = 300.0
+
+# Blend factor between mean and worst-seed per-seed score: fitness =
+# (1 - w) * mean + w * min. w=0.5 directly targets Entry 5's "mean masks a
+# single bad seed" concern without repeating Entry 2/5's opposite failure
+# (pure worst-case fitness collapsing the search to a degenerate idle
+# optimum): a genome cannot win by being spectacular on 4/5 seeds and
+# mediocre on the 5th, but it also isn't purely hostage to whichever single
+# seed the mutation operator happens to disturb most that generation.
+WORST_SEED_PENALTY_WEIGHT = 0.5
 
 PARAM_NAMES: tuple[str, ...] = tuple(field.name for field in fields(ReactiveParams))
 Genome = tuple[float, ...]
@@ -59,7 +81,13 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "heading_error_gain": (0.0, 0.5),
     "lookahead_near_gain": (0.0, 0.3),
     "lookahead_far_gain": (0.0, 0.3),
-    "wall_avoid_margin_m": (0.5, 6.5),
+    # Floor raised to the proven-safe DEFAULT_PARAMS value (0.998) after
+    # LAB_NOTEBOOK.md Entry 7's rejected candidate bought distance mainly by
+    # shaving this margin to 0.544 — safe on the 5 training seeds' specific
+    # corners but caused non-fatal damage on held-out validation corners.
+    # The search should earn distance from the new mechanisms, not by
+    # eroding an already-tuned safety margin below what's been validated.
+    "wall_avoid_margin_m": (0.998, 6.5),
     "wall_avoid_gain": (0.0, 1.0),
     "emergency_front_m": (0.5, 5.0),
     "emergency_steer": (0.0, 3.0),
@@ -77,6 +105,41 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "brake_min_distance_m": (0.1, 3.0),
     "brake_gain": (0.1, 3.0),
     "brake_quadratic_coeff": (0.0, 0.5),
+    # --- reactive2.py's new fields ---
+    # B. traction / wall-scrape / ineffective-brake detector.
+    "traction_loss_throttle_threshold": (0.1, 0.9),
+    "traction_loss_expected_accel_mps2": (0.2, 8.0),  # upper bound ~= max_engine_force/mass_kg (800/92)
+    "traction_loss_gain": (0.0, 1.0),
+    # C. diagonal early-warning wall avoidance (raw +-45 degree beams).
+    # Floor raised to 1.5 for the same Entry 7 reason as wall_avoid_margin_m:
+    # this mechanism has no prior "safe" baseline (it was always inert
+    # before), so 1.5 is a deliberately conservative minimum rather than the
+    # bare 0.5 that let the rejected candidate leave itself almost no
+    # diagonal buffer (0.541) at a nonzero gain.
+    "diagonal_avoid_margin_m": (1.5, 8.0),  # wider ceiling than wall_avoid_margin_m: +-45 beams see further
+    "diagonal_avoid_gain": (0.0, 1.0),
+    # D. three-point curvature/anticipation signal.
+    "curvature_gain": (0.0, 0.6),  # smaller-magnitude signal than a raw offset; needs more headroom
+    # E. damage-based caution scaler.
+    "damage_speed_gain": (0.0, 1.0),  # damage is already normalized 0-1
+    # F. roll/pitch safety cutoff.
+    "attitude_cutoff_deg": (2.0, 45.0),
+    "attitude_cutoff_gain": (0.0, 1.0),
+    # G. speed-scaled steering safety margins.
+    "speed_scaled_margin_lead_s": (0.0, 1.0),  # same order of magnitude as brake_lead_time_s
+    # H. instability/skid stability-recovery override. Bounds informed by the
+    # observed on-track distribution of these signals during a normal,
+    # zero-damage race (see LAB_NOTEBOOK.md Entry 7): yaw rate reaches up to
+    # ~270 deg/s and lateral acceleration up to ~43 m/s^2 even while driving
+    # safely, since lateral_acceleration_mps2 = speed * yaw_rate is a
+    # deterministic kinematic quantity, not an independent slip measurement —
+    # both bounds sit high enough that the search can find a threshold that
+    # doesn't trivially fire on ordinary hard cornering.
+    "instability_yaw_rate_deg_per_s": (60.0, 400.0),
+    "instability_lateral_accel_mps2": (5.0, 60.0),
+    "instability_gain": (0.0, 1.0),
+    # I. predictive multi-beam braking.
+    "brake_front_cone_blend": (0.0, 1.0),
 }
 
 
@@ -122,7 +185,13 @@ def make_controller(params: ReactiveParams):
 
 
 def evaluate_params(params: ReactiveParams, *, seeds: tuple[int, ...], round_seconds: float) -> float:
-    """Score a parameter set by average scored distance across seeds (three-tier)."""
+    """Score a parameter set by a mean/worst-seed blend of per-seed scores (three-tier penalty).
+
+    Returns ``(1 - w) * mean(race_scores) + w * min(race_scores)`` where
+    ``w = WORST_SEED_PENALTY_WEIGHT``, rather than a plain mean, so a genome
+    that is excellent on most seeds but eliminated on one cannot look good on
+    average alone. See LAB_NOTEBOOK.md, Entry 5.
+    """
     race_scores: list[float] = []
     for seed in seeds:
         result = run_headless_head_to_head(
@@ -147,7 +216,14 @@ def evaluate_params(params: ReactiveParams, *, seeds: tuple[int, ...], round_sec
             # short training rounds but getting eliminated in most held-out
             # validation races. See LAB_NOTEBOOK.md, Entry 4.
             race_scores.append(distance_m - DAMAGE_PENALTY_SCALE_M * damage)
-    return mean(race_scores)
+    mean_score = mean(race_scores)
+    worst_score = min(race_scores)
+    return mean_score - WORST_SEED_PENALTY_WEIGHT * (mean_score - worst_score)
+
+
+def _evaluate_genome(genome: Genome, *, seeds: tuple[int, ...], round_seconds: float) -> tuple[float, Genome]:
+    """Module-level (picklable) wrapper so ProcessPoolExecutor workers can call it."""
+    return evaluate_params(params_from_genome(genome), seeds=seeds, round_seconds=round_seconds), genome
 
 
 def run_search(
@@ -160,6 +236,7 @@ def run_search(
     round_seconds: float,
     rng_seed: int,
     seed_genome: Genome | None = None,
+    executor: ProcessPoolExecutor | None = None,
 ) -> tuple[ReactiveParams, float]:
     """Run the evolution strategy; return the best params found and their fitness.
 
@@ -168,6 +245,11 @@ def run_search(
     genome is still a plausible driver. Passing a previous call's best params
     back in as ``seed_genome`` chains a broad-exploration phase into a
     fine-tuning phase.
+
+    Each generation's population members are independent (mu+lambda) fitness
+    evaluations, so passing ``executor`` fans them out across processes —
+    the sequential version left most of the machine's cores idle every
+    generation despite the population having no cross-genome dependencies.
     """
     rng = random.Random(rng_seed)
     base_genome = genome_from_params(DEFAULT_PARAMS) if seed_genome is None else seed_genome
@@ -177,16 +259,13 @@ def run_search(
 
     best_genome = base_genome
     best_fitness = float("-inf")
+    evaluate_one = partial(_evaluate_genome, seeds=seeds, round_seconds=round_seconds)
 
     for generation in range(generations):
-        scored = sorted(
-            (
-                (evaluate_params(params_from_genome(genome), seeds=seeds, round_seconds=round_seconds), genome)
-                for genome in population
-            ),
-            key=lambda item: item[0],
-            reverse=True,
+        results = (
+            executor.map(evaluate_one, population) if executor is not None else map(evaluate_one, population)
         )
+        scored = sorted(results, key=lambda item: item[0], reverse=True)
         generation_best_fitness, generation_best_genome = scored[0]
         if generation_best_fitness > best_fitness:
             best_fitness, best_genome = generation_best_fitness, generation_best_genome
@@ -226,6 +305,23 @@ def trace_race(
 
     def traced_control(sensors: RobotSensors) -> RobotCommand:
         command = drive(sensors, params)
+
+        camera = sensors.camera
+        curvature_signal = 0.0
+        offsets = camera.lookahead_offsets_m
+        distances = camera.lookahead_distances_m
+        if camera.visible and len(offsets) >= 3 and len(distances) >= 3:
+            near_run_m = distances[1] - distances[0]
+            far_run_m = distances[2] - distances[1]
+            if near_run_m > 0.0 and far_run_m > 0.0:
+                slope_near = (offsets[1] - offsets[0]) / near_run_m
+                slope_far = (offsets[2] - offsets[1]) / far_run_m
+                curvature_signal = slope_far - slope_near
+        instability_triggered = (
+            abs(sensors.imu.yaw_rate_degrees_per_s) > params.instability_yaw_rate_deg_per_s
+            and abs(sensors.imu.lateral_acceleration_mps2) > params.instability_lateral_accel_mps2
+        )
+
         trace.append(
             {
                 "time_s": sensors.tick / 60.0,
@@ -239,6 +335,14 @@ def trace_race(
                 "damage": sensors.contact.damage,
                 "throttle": command.throttle,
                 "steer": command.steer,
+                "lateral_accel_mps2": sensors.imu.lateral_acceleration_mps2,
+                "forward_accel_mps2": sensors.imu.forward_acceleration_mps2,
+                "diag_left_m": sensors.wall_lidar.distance_at_angle_degrees(-45.0),
+                "diag_right_m": sensors.wall_lidar.distance_at_angle_degrees(45.0),
+                "roll_deg": sensors.imu.roll_degrees,
+                "pitch_deg": sensors.imu.pitch_degrees,
+                "curvature_signal": curvature_signal,
+                "instability_triggered": 1.0 if instability_triggered else 0.0,
             }
         )
         return command
@@ -276,6 +380,17 @@ def summarize_trace(
         f"braking: {braking_ticks}/{len(trace)} ticks "
         f"({100.0 * braking_ticks / max(1, len(trace)):.1f}%) | "
         f"front wall < 3m: {close_wall_ticks}/{len(trace)} ticks"
+    )
+
+    max_lateral_accel = max((abs(row["lateral_accel_mps2"]) for row in trace), default=0.0)
+    max_tilt_deg = max((max(abs(row["roll_deg"]), abs(row["pitch_deg"])) for row in trace), default=0.0)
+    instability_ticks = sum(1 for row in trace if row["instability_triggered"] > 0.0)
+    curvature_active_ticks = sum(1 for row in trace if abs(row["curvature_signal"]) > 1e-6)
+    print(
+        f"reactive2 signals: max|lateral_accel|={max_lateral_accel:.1f}m/s^2 "
+        f"max|roll or pitch|={max_tilt_deg:.1f}deg "
+        f"instability triggered: {instability_ticks}/{len(trace)} ticks "
+        f"curvature signal nonzero: {curvature_active_ticks}/{len(trace)} ticks"
     )
 
     first_contact_index = next((i for i, row in enumerate(trace) if row["any_contact_s"] > 0.0), None)
@@ -326,6 +441,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=110, help="Seed used by --diagnose")
     parser.add_argument("--diagnose-round-seconds", type=float, default=30.0)
     parser.add_argument("--tail", type=int, default=15, help="Ticks to print before an eliminated trace ends")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Parallel worker processes for fitness evaluation (0 = sequential, -1 = os.cpu_count())",
+    )
     args = parser.parse_args()
 
     if args.diagnose:
@@ -333,29 +454,40 @@ def main() -> None:
         summarize_trace(trace, stats, seed=args.seed, tail=args.tail)
         return
 
-    print(f"=== Phase 1: broad exploration (sigma={args.mutation_sigma_fraction}) ===")
-    best_params, best_fitness = run_search(
-        population_size=args.population,
-        generations=args.generations,
-        elite_count=args.elite,
-        mutation_sigma_fraction=args.mutation_sigma_fraction,
-        seeds=tuple(args.seeds),
-        round_seconds=args.round_seconds,
-        rng_seed=args.rng_seed,
-    )
+    worker_count = (os.cpu_count() or 1) if args.workers < 0 else args.workers
+    executor = ProcessPoolExecutor(max_workers=worker_count) if worker_count > 0 else None
+    try:
+        if executor is not None:
+            print(f"(parallel: {worker_count} worker processes)")
 
-    if args.phase2_generations > 0:
-        print(f"=== Phase 2: fine-tuning (sigma={args.phase2_mutation_sigma_fraction}) ===")
+        print(f"=== Phase 1: broad exploration (sigma={args.mutation_sigma_fraction}) ===")
         best_params, best_fitness = run_search(
             population_size=args.population,
-            generations=args.phase2_generations,
+            generations=args.generations,
             elite_count=args.elite,
-            mutation_sigma_fraction=args.phase2_mutation_sigma_fraction,
+            mutation_sigma_fraction=args.mutation_sigma_fraction,
             seeds=tuple(args.seeds),
             round_seconds=args.round_seconds,
-            rng_seed=args.rng_seed + 1,
-            seed_genome=genome_from_params(best_params),
+            rng_seed=args.rng_seed,
+            executor=executor,
         )
+
+        if args.phase2_generations > 0:
+            print(f"=== Phase 2: fine-tuning (sigma={args.phase2_mutation_sigma_fraction}) ===")
+            best_params, best_fitness = run_search(
+                population_size=args.population,
+                generations=args.phase2_generations,
+                elite_count=args.elite,
+                mutation_sigma_fraction=args.phase2_mutation_sigma_fraction,
+                seeds=tuple(args.seeds),
+                round_seconds=args.round_seconds,
+                rng_seed=args.rng_seed + 1,
+                seed_genome=genome_from_params(best_params),
+                executor=executor,
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     print("-" * 72)
     print(f"best training fitness: {best_fitness:.1f}m (seeds {args.seeds}, {args.round_seconds:.0f}s rounds)")

@@ -233,3 +233,82 @@ Concluded that manual single-variable A/B testing has reached its limit here —
 - Run the newly bounded, two-phase (broad exploration then fine-tuning) search on all five training seeds at once — directly targeting the cross-seed generalization failure from Entry 4, which only ever trained on two.
 - Validate any search result against the full, disjoint validation set `(42, 2027, 8675, 31415, 777001)` before accepting it, exactly as required this time.
 - If the search cannot beat 432.5 m either, that is itself a meaningful, reportable conclusion: this parameterization of the reactive controller may be near its practical ceiling on this track without a further architectural change (e.g. the anticipatory lookahead-based apex bias from Entry 4, tested in isolation this time rather than simultaneously with a speed increase).
+
+## Entry 7 — reactive2.py: New Sensor Mechanisms, Worst-Seed Search, Rejected on Validation
+
+**Date and time:** September 2, 2026
+
+**Participants and contributions:**
+- Leon Aaron — set the three-step gated protocol (build mechanisms → search → validate on held-out seeds), decided to descope other-robot lidar/competitor-camera as unmeasurable in this solo-training harness, and pushed back mid-run to question whether a stalled search was actually a machine-sleep artifact or an unparallelized algorithm — leading to the multiprocessing fix below.
+- AI coding agent (Claude Code) — designed and implemented `src/controllers/reactive2.py`'s new mechanisms, built `scripts/optimize_reactive2.py`'s worst-seed-aware search, diagnosed and fixed a hung search process, added multiprocessing, and ran the final validation.
+
+**Question or objective:**
+Can genuinely new sensor signals — ones `reactive.py` never reads (forward/lateral acceleration, the raw ±45° wall-lidar beams, all three lookahead points, `contact.damage`, roll/pitch, multi-beam braking) — break the ~442-445 m/30 s plateau documented in Entries 3 and 6, without reintroducing Entry 4's confounded-variables mistake or Entry 5's mean-only-fitness blind spot?
+
+**What we investigated or changed:**
+- **Step 1 (mechanisms):** Added 8 independently-gated mechanisms (A–I, with A later removed) to `reactive2.py`, each defaulting to a neutral gain so `gain=0` reproduces `reactive.py` bit-for-bit. Mechanism A (a lateral-acceleration cornering governor) was removed after isolated testing showed `imu.lateral_acceleration_mps2` is exactly `speed_mps * radians(yaw_rate_degrees_per_s)` — a deterministic restatement of yaw rate, not an independent grip measurement — and regressed distance 17–46% at every setting tried. Confirmed the remaining mechanisms wire up correctly (diagonal beams read genuinely different distances than the ±90° beams; the curvature signal swings sign on real corners) and that gain=0 reproduces `reactive.py` exactly.
+- **Step 2 (search):** Added 16 new `PARAM_BOUNDS` and a worst-seed-aware fitness, `fitness = mean - 0.5*(mean - min)` over the 5 training seeds `(13, 55, 110, 271, 997)`, directly targeting Entry 5's "mean masks a bad seed" concern. Ran a two-phase evolution strategy — 18 broad-exploration generations (σ=0.25) then 10 fine-tuning generations (σ=0.08), population 20 — at 20 s training rounds.
+- **Mid-run infrastructure problem:** the first full-search attempt appeared to hang at phase-2 generation 7 for 47 minutes with no log progress. CPU sampling showed the process burning essentially zero CPU during that window (0.34 CPU-seconds over a 5-second sample) — not "slow," genuinely stalled, most likely from a machine sleep/wake cycle during the run. Separately, and regardless of the hang's cause, `run_search`'s population evaluation was a plain sequential Python loop with no use of the machine's 14 logical cores. Killed the stuck run and added `concurrent.futures.ProcessPoolExecutor`-based parallelism across the population (`scripts/optimize_reactive2.py`, `_evaluate_genome` + `--workers` flag, default one persistent pool for the whole run rather than one per generation, reused across both search phases). A smoke test confirmed identical (0-damage) results to the sequential version. The full 28-generation search then completed in well under the original ~35–45 minute estimate, using `--workers -1` (all logical cores).
+- **Step 2 result:** best training fitness 310.0 m (blended), up from the unmutated baseline's 291.8 m under the same blend — all 5 training seeds survived with 0.00 damage, distances 305.9–323.8 m at 20 s rounds. Passed the Step 2 gate.
+- **Step 3 (validation):** wrote `scripts/validate_reactive2_candidate.py` to run the candidate on the 5 disjoint validation seeds, 5 races each at 30 s rounds (25 races total) — the same protocol as Entry 6. First pass of the script only read `result.races[0]`, silently scoring 5 races instead of 25 (`run_headless_head_to_head`'s `race_count` returns one entry per race in `result.races`, not one aggregate entry) — caught and fixed before trusting the result.
+
+**Evidence:**
+- AI-agent assistance: Claude Code designed all 8 mechanisms and their bounds, diagnosed the lateral-acceleration redundancy, diagnosed the stalled search via direct CPU sampling rather than assumption, implemented the multiprocessing fix, and caught its own validation-script bug before reporting results.
+- Commits or code: `src/controllers/reactive2.py` (new mechanisms), `scripts/optimize_reactive2.py` (bounds, worst-seed fitness, multiprocessing), `scripts/validate_reactive2_candidate.py` (new, Step 3 validation).
+- Experiment output: `step2_search.log` (full 28-generation search transcript) and the 25-race validation run (below).
+
+**What we observed:**
+- Validation, 25 races across 5 held-out seeds at 30 s rounds:
+
+  | seed | distances (m) | damages |
+  |---|---|---|
+  | 42 | 458.3, 435.5, 487.2, 485.1, 461.9 | 0.00 ×5 |
+  | 2027 | 379.2, 451.7, 447.4, 474.3, 474.1 | 0.00 ×5 |
+  | 8675 | 487.2, 410.4, 465.8, 439.3, 488.3 | 0.00, **0.25**, 0.00, 0.00, 0.00 |
+  | 31415 | 429.5, 458.4, 478.3, 393.9, 450.4 | **0.01**, 0.00, 0.00, **0.03**, 0.00 |
+  | 777001 | 459.3, 461.4, 458.2, 487.7, 430.3 | 0.00, **0.01**, 0.00, 0.00, **0.01** |
+
+  Mean distance **454.1 m** — a real ~2–3% gain over the 442–445 m baseline, with zero eliminations. But non-zero (non-fatal) damage occurred in 5 of the 25 races, including one 0.25-damage graze, on seeds the search never trained on.
+- This is a genuine generalization gap, not a training-side bug: the worst-seed-aware fitness did its job on the 5 seeds it could see (0.00 damage, every training seed) but the held-out seeds exposed corner geometry or wall configurations the candidate hadn't been pressured against. The new mechanisms' final tuned gains were mostly tiny (`traction_loss_gain≈0.017`, `diagonal_avoid_gain≈0.006`, `curvature_gain≈0.018`, `instability_gain≈1.5e-05`) — the search found modest use for them but didn't lean on any single one heavily, consistent with the previously-documented plateau being a real, hard-to-move local optimum rather than one hiding an easy win.
+
+**Decision and rationale:**
+**Rejected per the pre-committed Step 3 gate** (0 damage in all 25 validation races AND mean distance beats baseline — both required, not either). Distance alone would have passed; damage discipline did not generalize to unseen seeds. Per Entry 6's precedent, this is reported as a genuine negative result rather than relaxed after the fact: `reactive2.py`'s `DEFAULT_PARAMS` is **not** updated, and remains a byte-for-byte copy of `reactive.py`'s validated 442–445 m baseline.
+
+**Next steps:**
+- The new sensor mechanisms (B–I) are in place and confirmed non-regressive at gain=0, so they remain available for a future search attempt without redoing Step 1.
+- A future search could tighten the worst-seed penalty weight (`WORST_SEED_PENALTY_WEIGHT`, currently 0.5) toward 1.0, or fold 2–3 of the validation seeds into training (shrinking the held-out set) so the fitness function is pressured by more corner configurations before validation — at the cost of a smaller, less independent final check.
+- The `--workers` multiprocessing fix (`ProcessPoolExecutor` across the population, `--workers -1` to use all logical cores) cut this search's wall-clock time from an estimated ~35–45 minutes to well under that on a 14-core machine; it carries forward to any future `optimize_reactive2.py` run regardless of whether this particular mechanism set is revisited, and should be the default going forward rather than the sequential path.
+- A structurally different next attempt worth considering: train a small PyTorch model (e.g. a compact MLP policy, in the spirit of Entry 2's neuroevolution strategy but gradient-trained via imitation or RL rather than evolution-searched) directly on the full sensor vector, rather than continuing to hand-design more gated mechanisms on top of a fixed reactive control law. This could let the model discover nonlinear sensor combinations (e.g. a learned fusion of the corner-severity signals that Entry 7 deliberately kept hand-separated) that a human-authored formula is unlikely to find, at the cost of losing the interpretability that made every entry in this notebook diagnosable.
+
+## Entry 8 — reactive2.py Re-Search with a Safety-Margin Floor: Damage Fixed, Gain Erased
+
+**Date and time:** September 2, 2026 (continued)
+
+**Participants and contributions:**
+- Leon Aaron — asked directly whether Entry 7's rejected candidate's distance gain could be salvaged rather than discarded outright, prompting the root-cause check below instead of simply re-running the same search.
+- AI coding agent (Claude Code) — diagnosed the specific parameter responsible for Entry 7's validation damage, tightened its search bound, re-ran the full search and validation, and reported the (negative) result rather than the hoped-for one.
+
+**Question or objective:**
+Entry 7's rejected candidate had a real ~2-3% distance gain (454.1 m mean) undercut by non-fatal damage on 5/25 held-out races. Was that damage caused by the new sensor mechanisms themselves misbehaving on unfamiliar corners, or by the search exploiting slack in an existing, already-validated safety parameter? If the latter, constraining that parameter should let the search keep whatever real gain the new mechanisms offer while eliminating the damage.
+
+**What we investigated or changed:**
+- Compared Entry 7's rejected genome against `reactive2.py`'s safe `DEFAULT_PARAMS`: `wall_avoid_margin_m` had been shaved from a proven-safe 0.998 m to 0.544 m (nearly halved), and the new `diagonal_avoid_margin_m` — inert at baseline — had been left at a thin 0.541 m at a nonzero gain. Both are core wall-avoidance buffers, not among the new mechanisms being evaluated.
+- Raised `PARAM_BOUNDS` floors in `scripts/optimize_reactive2.py`: `wall_avoid_margin_m` from (0.5, 6.5) to (0.998, 6.5) — pinned to the proven-safe default — and `diagonal_avoid_margin_m` from (0.5, 8.0) to (1.5, 8.0), a deliberately conservative floor since that mechanism had no prior safe baseline to pin to.
+- Re-ran the identical two-phase search (population 20, 18+10 generations, same 5 training seeds, `--workers -1`) and re-validated on the same 25-race held-out suite via `scripts/validate_reactive2_candidate.py`.
+
+**Evidence:**
+- `step2_search_v2.log` (full re-run transcript) and the corresponding 25-race validation output.
+- Commits or code: `scripts/optimize_reactive2.py` (`PARAM_BOUNDS` floor changes, with inline comments citing this diagnosis), `scripts/validate_reactive2_candidate.py` (`CANDIDATE` updated to the new genome).
+
+**What we observed:**
+- Training: best fitness 297.5 m (down from Entry 7's 310.0 m, as expected — less room to exploit the margin), 0.00 damage on all 5 training seeds. `wall_avoid_margin_m` converged to 1.125 m (above the new floor, so the search found a genuinely better value rather than just hitting the wall); `diagonal_avoid_margin_m` converged exactly to its new floor of 1.5 m, meaning the search still wants it lower and is now capped.
+- Validation, 25 races across the same 5 held-out seeds at 30 s rounds: **zero damage in every single race** (max damage 0.00, versus Entry 7's max 0.25) — the fix fully closed the generalization gap. But mean distance came back to **442.2 m**, statistically indistinguishable from the 442-445 m baseline it needs to strictly exceed.
+- Interpretation: Entry 7's apparent "gain" was almost entirely the margin-shaving exploit, not the new sensor mechanisms. With that exploit closed off, the new mechanisms (B-I) on their own contribute no measurable net improvement on this track — their tuned gains stayed small in both search runs (Entry 7 and 8 alike), and removing the one lever that did move the needle returns the result to baseline. This is now a second, independent confirmation of the ~442-445 m plateau, arrived at via a different search under a stricter constraint, not just a repeat of Entry 6's finding.
+
+**Decision and rationale:**
+**Rejected again**, this time for the opposite reason from Entry 7: safety generalizes perfectly, but there is no distance gain left to accept. `reactive2.py`'s `DEFAULT_PARAMS` remains unchanged. This is a cleaner negative result than Entry 7's: it isolates that the plateau is real and that reactive2.py's new mechanisms, evaluated honestly (without borrowing margin from an already-tuned safety parameter), do not move it — closing off the most obvious "maybe we can just fix the one bad parameter" follow-up before it gets tried again.
+
+**Next steps:**
+- Do not re-attempt a third search with the same mechanism set and the same margin floors expecting a different outcome — two independent runs now agree. Any further reactive-controller work here should target a genuinely different lever (e.g. the apex-bias/lookahead geometry, last touched in Entry 3/4) rather than another blind evolutionary pass over the same parameter set.
+- The PyTorch-model direction from Entry 7 remains the most promising path for a real step-change, since it does not depend on a human first guessing which hand-designed mechanism might help.
+- Keep the `--workers` multiprocessing default for any future `optimize_reactive2.py` run — both re-runs in this investigation benefited from it, and it is what made a same-day two-attempt turnaround (Entry 7 then Entry 8) practical at all.

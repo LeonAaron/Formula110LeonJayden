@@ -1,5 +1,8 @@
 # Formula 110 Sensor Reference
 
+# IMPORTANT COMMAND
+uv run python scripts/export_student_controllers.py controllers.reactive2   
+
 A controller receives one immutable `RobotSensors` snapshot on every simulation
 tick:
 

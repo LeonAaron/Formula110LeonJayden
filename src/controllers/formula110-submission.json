@@ -1,4 +1,4 @@
 {
     "schema_version": 1,
-    "controller_module": "controllers.reactive"
+    "controller_module": "controllers.reactive2"
 }

@@ -1,0 +1,101 @@
+(parallel: 14 worker processes)
+=== Phase 1: broad exploration (sigma=0.25) ===
+generation 0: best=  291.8m mean=  216.7m worst=  -54.0m
+generation 1: best=  291.8m mean=  244.3m worst=   92.9m
+generation 2: best=  291.8m mean=  242.2m worst=  157.9m
+generation 3: best=  291.8m mean=  241.7m worst=  141.4m
+generation 4: best=  291.8m mean=  242.6m worst=   89.9m
+generation 5: best=  293.6m mean=  233.5m worst=  144.9m
+generation 6: best=  294.3m mean=  235.0m worst=    0.4m
+generation 7: best=  295.0m mean=  244.8m worst=  162.7m
+generation 8: best=  295.0m mean=  237.2m worst=  -15.0m
+generation 9: best=  295.0m mean=  232.0m worst=  -53.8m
+generation 10: best=  297.2m mean=  247.6m worst=  128.8m
+generation 11: best=  297.2m mean=  223.4m worst=   45.5m
+generation 12: best=  297.2m mean=  220.5m worst=   22.5m
+generation 13: best=  297.5m mean=  245.5m worst=   50.0m
+generation 14: best=  297.5m mean=  247.2m worst=  150.7m
+generation 15: best=  297.5m mean=  165.1m worst= -106.5m
+generation 16: best=  306.6m mean=  217.7m worst=  -60.7m
+generation 17: best=  306.6m mean=  217.9m worst=  -18.1m
+=== Phase 2: fine-tuning (sigma=0.08) ===
+generation 0: best=  306.6m mean=  245.6m worst=  115.6m
+generation 1: best=  308.5m mean=  250.2m worst= -168.2m
+generation 2: best=  308.5m mean=  274.8m worst=  207.0m
+generation 3: best=  308.5m mean=  283.2m worst=  211.3m
+generation 4: best=  308.5m mean=  258.0m worst=  100.5m
+generation 5: best=  308.5m mean=  282.9m worst=  217.7m
+generation 6: best=  308.5m mean=  269.2m worst=  152.7m
+generation 7: best=  310.0m mean=  241.7m worst=    7.6m
+generation 8: best=  310.0m mean=  273.1m worst=  149.6m
+generation 9: best=  310.0m mean=  284.0m worst=  181.4m
+------------------------------------------------------------------------
+best training fitness: 310.0m (seeds [13, 55, 110, 271, 997], 20s rounds)
+ReactiveParams(
+    center_offset_gain=0.12979069520120795,
+    heading_error_gain=0.0901220539700354,
+    lookahead_near_gain=0.03448208574090716,
+    lookahead_far_gain=0.03542941446488973,
+    wall_avoid_margin_m=0.5443168484775527,
+    wall_avoid_gain=0.5817397888845758,
+    emergency_front_m=4.514447830276754,
+    emergency_steer=0.4391503973737006,
+    recovery_steer=0.8353762539563862,
+    recovery_throttle=-0.17420893997103193,
+    steer_limit=0.5973669107995899,
+    turn_sharpness_deg=6.650653900870647,
+    apex_bias_max_m=0.27414944958531756,
+    max_speed_mps=17.518932879561532,
+    speed_gain=0.31078018006072994,
+    corner_speed_gain=0.005129779925181481,
+    corner_signal_deg=28.489220460012344,
+    corner_yaw_rate_deg_per_s=53.5588501405949,
+    brake_lead_time_s=0.11096241708988366,
+    brake_min_distance_m=0.26027941677472827,
+    brake_gain=2.114594370353571,
+    brake_quadratic_coeff=0.0,
+    traction_loss_throttle_threshold=0.3294844608431256,
+    traction_loss_expected_accel_mps2=1.6785250897541288,
+    traction_loss_gain=0.017126895794964795,
+    diagonal_avoid_margin_m=0.5412875748577898,
+    diagonal_avoid_gain=0.005883430529161921,
+    curvature_gain=0.0177514282134405,
+    damage_speed_gain=0.0,
+    attitude_cutoff_deg=10.084514039342741,
+    attitude_cutoff_gain=0.025022547556884392,
+    speed_scaled_margin_lead_s=0.01287050073461204,
+    instability_yaw_rate_deg_per_s=158.94143292624656,
+    instability_lateral_accel_mps2=8.122016236863232,
+    instability_gain=1.4879199702851238e-05,
+    brake_front_cone_blend=0.025474090991754038,
+)
+------------------------------------------------------------------------
+diagnostic trace of the best params on the training seeds:
+=== seed 13: survived ===
+distance=320.1m laps=1 damage=0.00 max_speed=17.3m/s marshal=0x ticks=1200
+braking: 0/1200 ticks (0.0%) | front wall < 3m: 8/1200 ticks
+reactive2 signals: max|lateral_accel|=42.5m/s^2 max|roll or pitch|=1.4deg instability triggered: 0/1200 ticks curvature signal nonzero: 1200/1200 ticks
+
+=== seed 55: survived ===
+distance=309.3m laps=1 damage=0.00 max_speed=17.3m/s marshal=0x ticks=1200
+braking: 2/1200 ticks (0.2%) | front wall < 3m: 10/1200 ticks
+reactive2 signals: max|lateral_accel|=50.4m/s^2 max|roll or pitch|=2.4deg instability triggered: 8/1200 ticks curvature signal nonzero: 1198/1200 ticks
+first contact at t=11.87s: speed=16.5m/s front=7.98m left=6.91m right=3.71m heading_error=10.8 center_offset=-2.72 -> throttle=-0.17 steer=-0.84
+
+=== seed 110: survived ===
+distance=305.9m laps=1 damage=0.00 max_speed=17.3m/s marshal=0x ticks=1200
+braking: 20/1200 ticks (1.7%) | front wall < 3m: 6/1200 ticks
+reactive2 signals: max|lateral_accel|=42.5m/s^2 max|roll or pitch|=4.8deg instability triggered: 2/1200 ticks curvature signal nonzero: 1199/1200 ticks
+first contact at t=11.82s: speed=17.3m/s front=37.94m left=4.21m right=3.95m heading_error=0.3 center_offset=-0.13 -> throttle=-0.17 steer=-0.84
+
+=== seed 271: survived ===
+distance=311.7m laps=1 damage=0.00 max_speed=17.3m/s marshal=0x ticks=1200
+braking: 1/1200 ticks (0.1%) | front wall < 3m: 13/1200 ticks
+reactive2 signals: max|lateral_accel|=42.4m/s^2 max|roll or pitch|=2.4deg instability triggered: 4/1200 ticks curvature signal nonzero: 1200/1200 ticks
+first contact at t=11.75s: speed=10.3m/s front=7.97m left=5.31m right=3.36m heading_error=3.2 center_offset=-1.22 -> throttle=-0.17 steer=-0.84
+
+=== seed 997: survived ===
+distance=323.8m laps=1 damage=0.00 max_speed=17.3m/s marshal=0x ticks=1200
+braking: 0/1200 ticks (0.0%) | front wall < 3m: 23/1200 ticks
+reactive2 signals: max|lateral_accel|=42.5m/s^2 max|roll or pitch|=1.4deg instability triggered: 0/1200 ticks curvature signal nonzero: 1200/1200 ticks
+
