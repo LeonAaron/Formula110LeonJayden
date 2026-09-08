@@ -1,5 +1,10 @@
 """Friendly imports for student controllers and simple simulator scripts."""
 
+try:
+    import torch as _torch  # noqa: F401  # Windows: torch must load before panda3d's DLLs or its own init fails.
+except ImportError:
+    pass
+
 from racing.game.config import CameraView, GameConfig, HeadToHeadViewerConfig, RacingAudioConfig
 from racing.game.recording import (
     HUMAN_GAMEPLAY_SCHEMA_VERSION,
