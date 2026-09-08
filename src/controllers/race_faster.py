@@ -1,8 +1,8 @@
-"""Improved submission module: the reactive controller.
+"""Improved submission module: the v3 reactive controller.
 
-Re-exports ``controllers.reactive`` under the name the autograder requires.
+Re-exports ``controllers.reactive_v3`` under the name the autograder requires.
 """
 
-from controllers.reactive import RACING_COLOR, RACING_NAME, control
+from controllers.reactive_v3 import RACING_COLOR, RACING_NAME, control
 
 __all__ = ["RACING_COLOR", "RACING_NAME", "control"]

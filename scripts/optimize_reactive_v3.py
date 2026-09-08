@@ -40,7 +40,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import random
+from concurrent.futures import Executor, ProcessPoolExecutor
 from dataclasses import fields, replace
 from statistics import mean
 
@@ -156,6 +158,36 @@ def evaluate_params(params: ReactiveParams, *, seeds: tuple[int, ...], round_sec
     return mean(race_scores)
 
 
+def _evaluate_genome_task(task: tuple[Genome, tuple[int, ...], float]) -> float:
+    """Evaluate one genome. Module-level and single-argument so it can be sent to a process pool."""
+    genome, seeds, round_seconds = task
+    return evaluate_params(params_from_genome(genome), seeds=seeds, round_seconds=round_seconds)
+
+
+def score_population(
+    population: list[Genome],
+    *,
+    seeds: tuple[int, ...],
+    round_seconds: float,
+    executor: Executor | None,
+) -> list[tuple[float, Genome]]:
+    """Score every genome and return ``(fitness, genome)`` pairs, best first.
+
+    Genome evaluations are independent full simulation rollouts, so they
+    parallelize across processes cleanly. Each rollout builds its own headless
+    Panda3D instance and is seeded deterministically, so a parallel run
+    reproduces the serial run's fitnesses exactly. ``executor=None`` keeps the
+    original serial path.
+    """
+    tasks = [(genome, seeds, round_seconds) for genome in population]
+    fitnesses = (
+        [_evaluate_genome_task(task) for task in tasks]
+        if executor is None
+        else list(executor.map(_evaluate_genome_task, tasks))
+    )
+    return sorted(zip(fitnesses, population, strict=True), key=lambda item: item[0], reverse=True)
+
+
 def run_search(
     *,
     population_size: int,
@@ -166,6 +198,7 @@ def run_search(
     round_seconds: float,
     rng_seed: int,
     seed_genome: Genome | None = None,
+    workers: int = 1,
 ) -> tuple[ReactiveParams, float]:
     """Run the evolution strategy; return the best params found and their fitness.
 
@@ -174,6 +207,10 @@ def run_search(
     genome is still a plausible driver. Passing a previous call's best params
     back in as ``seed_genome`` chains a broad-exploration phase into a
     fine-tuning phase.
+
+    ``workers`` > 1 evaluates each generation's population across that many
+    processes; the pool is created once for the whole search so its startup
+    cost is not paid per generation.
     """
     rng = random.Random(rng_seed)
     base_genome = genome_from_params(DEFAULT_PARAMS) if seed_genome is None else seed_genome
@@ -184,31 +221,35 @@ def run_search(
     best_genome = base_genome
     best_fitness = float("-inf")
 
-    for generation in range(generations):
-        scored = sorted(
-            (
-                (evaluate_params(params_from_genome(genome), seeds=seeds, round_seconds=round_seconds), genome)
-                for genome in population
-            ),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        generation_best_fitness, generation_best_genome = scored[0]
-        if generation_best_fitness > best_fitness:
-            best_fitness, best_genome = generation_best_fitness, generation_best_genome
+    executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        for generation in range(generations):
+            scored = score_population(
+                population,
+                seeds=seeds,
+                round_seconds=round_seconds,
+                executor=executor,
+            )
+            generation_best_fitness, generation_best_genome = scored[0]
+            if generation_best_fitness > best_fitness:
+                best_fitness, best_genome = generation_best_fitness, generation_best_genome
 
-        fitnesses = [fitness for fitness, _ in scored]
-        print(
-            f"generation {generation}: best={generation_best_fitness:7.1f}m "
-            f"mean={mean(fitnesses):7.1f}m worst={min(fitnesses):7.1f}m"
-        )
+            fitnesses = [fitness for fitness, _ in scored]
+            print(
+                f"generation {generation}: best={generation_best_fitness:7.1f}m "
+                f"mean={mean(fitnesses):7.1f}m worst={min(fitnesses):7.1f}m",
+                flush=True,
+            )
 
-        elites = [genome for _, genome in scored[:elite_count]]
-        child_count = population_size - len(elites)
-        children = [
-            mutate(elites[rng.randrange(len(elites))], rng, mutation_sigma_fraction) for _ in range(child_count)
-        ]
-        population = [*elites, *children]
+            elites = [genome for _, genome in scored[:elite_count]]
+            child_count = population_size - len(elites)
+            children = [
+                mutate(elites[rng.randrange(len(elites))], rng, mutation_sigma_fraction) for _ in range(child_count)
+            ]
+            population = [*elites, *children]
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     return params_from_genome(best_genome), best_fitness
 
@@ -322,6 +363,12 @@ def main() -> None:
     parser.add_argument("--round-seconds", type=float, default=20.0)
     parser.add_argument("--rng-seed", type=int, default=1, help="Seed for the evolutionary search's own randomness")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 2) - 2),
+        help="Processes used to evaluate a generation's population (1 = serial)",
+    )
+    parser.add_argument(
         "--phase2-generations",
         type=int,
         default=0,
@@ -348,6 +395,7 @@ def main() -> None:
         seeds=tuple(args.seeds),
         round_seconds=args.round_seconds,
         rng_seed=args.rng_seed,
+        workers=args.workers,
     )
 
     if args.phase2_generations > 0:
@@ -361,6 +409,7 @@ def main() -> None:
             round_seconds=args.round_seconds,
             rng_seed=args.rng_seed + 1,
             seed_genome=genome_from_params(best_params),
+            workers=args.workers,
         )
 
     print("-" * 72)

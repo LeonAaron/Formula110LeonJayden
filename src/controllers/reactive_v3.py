@@ -63,61 +63,73 @@ class ReactiveParams:
     """Tunable gains and thresholds for the reactive controller.
 
     Defaults are the result of scripts/optimize_reactive_v3.py (bounded
-    two-phase evolution strategy seeded from the v2 defaults, trained on 5
-    seeds, 20s rounds), jointly re-tuning around the v3 off-axis emergency
-    steer scan (see module docstring). Validated at the standard 30s protocol:
-    50/50 survived, 0.00 damage in every race across 5 training seeds (13, 55,
-    110, 271, 997, avg. 466.0 m) and 5 disjoint held-out seeds (42, 110, 271,
-    997, 2027, avg. 463.8 m) — beats v2's ~442-445 m baseline by ~5%.
+    two-phase evolution strategy, 20 genomes x 25 broad + 15 fine-tuning
+    generations, trained on 7 seeds at 20s rounds: 13, 55, 110, 271, 997,
+    3001, 4002), seeded from the previous defaults and jointly re-tuning
+    around the v3 off-axis emergency steer scan (see module docstring).
+
+    Validated at the standard 30s protocol (5 races/seed) on 42, 110, 271,
+    997, 2027: 25/25 survived, 0.00 damage in every race, avg. 468.7 m — up
+    from the previous defaults' 463.8 m on the identical protocol. The gain is
+    concentrated on the weakest seed (2027: 444.6 -> 466.3 m), tightening the
+    per-seed spread from 31.5 m to 23.0 m; seed 42 gave back 4.1 m. Note that
+    110/271/997 appear in both the training and validation lists, so 42 and
+    2027 are the only genuinely unseen seeds here — those two alone went
+    458.7 -> 467.5 m, so the improvement is not an artifact of the overlap.
+
+    Broad exploration (sigma=0.25) found nothing better than the seeded
+    baseline across all 25 generations; the entire gain came from the
+    sigma=0.08 fine-tuning phase, which suggests these values sit in a fairly
+    tight local optimum.
     """
 
     # Steering: follow the track centerline and upcoming curvature.
-    center_offset_gain: float = 0.15867595882939128
-    heading_error_gain: float = 0.06035888978849509
-    lookahead_near_gain: float = 0.0028609842602109296
-    lookahead_far_gain: float = 0.030845733142976773
+    center_offset_gain: float = 0.12229326954711707
+    heading_error_gain: float = 0.056192419287577795
+    lookahead_near_gain: float = 0.0036761772898821067
+    lookahead_far_gain: float = 0.04033397631842171
 
     # Steering: nudge away from a close side wall before it becomes urgent.
-    wall_avoid_margin_m: float = 0.77070465325732
-    wall_avoid_gain: float = 0.419451852424062
+    wall_avoid_margin_m: float = 0.7677215051928223
+    wall_avoid_gain: float = 0.35174638765757454
 
     # Steering: override toward open space when a wall is immediately ahead.
-    emergency_front_m: float = 3.7190816425618247
-    emergency_steer: float = 0.3833736277782755
+    emergency_front_m: float = 3.846023723575205
+    emergency_steer: float = 0.3275309120292628
 
     # Steering (v3): how wide a cone around straight-ahead the emergency
     # override scans for the forward-projected wall distance (see module
     # docstring). Settled much narrower than the 45-degree starting point —
     # covers roughly the -20/0/20 beams. Not used for braking.
-    wall_scan_cone_deg: float = 20.921628980554303
+    wall_scan_cone_deg: float = 25.795402779647443
 
     # Steering: back away from active contact toward whichever side is open.
-    recovery_steer: float = 1.4022570605692561
-    recovery_throttle: float = -0.19749445703461666
+    recovery_steer: float = 1.2506016466133008
+    recovery_throttle: float = -0.15530413084727615
 
-    steer_limit: float = 0.7547668233978098
+    steer_limit: float = 0.7273114677075063
 
     # Steering: infer turn sharpness from heading error and hug the inside
     # of the turn (right side on a right turn, left side on a left turn).
-    turn_sharpness_deg: float = 13.990201185579153
-    apex_bias_max_m: float = 0.22598154381946334
+    turn_sharpness_deg: float = 12.153498231519766
+    apex_bias_max_m: float = 0.21915967092080046
 
     # Throttle: target speed, optionally reduced proactively for an anticipated
     # turn (camera heading error) or an actual one already underway (yaw
     # rate). corner_speed_gain settled near 0 in search — negligible effect.
-    max_speed_mps: float = 18.228524022338696
-    speed_gain: float = 0.14910084616033148
-    corner_speed_gain: float = 0.010784261711264818
-    corner_signal_deg: float = 27.571947875467167
-    corner_yaw_rate_deg_per_s: float = 69.58077851772781
+    max_speed_mps: float = 18.474453632987856
+    speed_gain: float = 0.13456128958890018
+    corner_speed_gain: float = 0.009731541992039133
+    corner_signal_deg: float = 26.727155579997856
+    corner_yaw_rate_deg_per_s: float = 65.31069316941816
 
     # Throttle: brake in time for the wall directly ahead. Distance is
     # linear-in-speed plus an optional speed-squared term (true stopping
     # distance under constant deceleration is quadratic in speed);
     # brake_quadratic_coeff settled at 0 in search — not useful here.
-    brake_lead_time_s: float = 0.1631312859116326
-    brake_min_distance_m: float = 0.26609957022279995
-    brake_gain: float = 0.8689202533261862
+    brake_lead_time_s: float = 0.12566842391480273
+    brake_min_distance_m: float = 0.20860217040280343
+    brake_gain: float = 0.7842894334027986
     brake_quadratic_coeff: float = 0.0
 
 
