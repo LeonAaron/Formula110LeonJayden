@@ -26,6 +26,11 @@ from racing_line_follower import DEFAULT_FOLLOWER_PARAMS, RacingLineFollowerPara
 ELIMINATION_PENALTY_M = 350.0
 IDLE_DISTANCE_M = 10.0
 IDLE_PENALTY_M = 20.0
+# Non-fatal damage must cost enough to outweigh the distance gained by clipping a
+# wall at speed - without this, the search finds genomes that survive training
+# seeds with real damage, which then eliminate on held-out seeds after distillation
+# (see LAB_NOTEBOOK.md Entry 12: flat_speed_mps=23.09 was exactly this failure).
+DAMAGE_PENALTY_M = 600.0
 
 PARAM_NAMES: tuple[str, ...] = tuple(field.name for field in fields(RacingLineFollowerParams))
 Genome = tuple[float, ...]
@@ -71,7 +76,7 @@ def evaluate_params(
         elif stats.scored_distance_m < IDLE_DISTANCE_M:
             race_scores.append(stats.scored_distance_m - IDLE_PENALTY_M)
         else:
-            race_scores.append(stats.scored_distance_m)
+            race_scores.append(stats.scored_distance_m - DAMAGE_PENALTY_M * stats.damage)
     return mean(race_scores)
 
 

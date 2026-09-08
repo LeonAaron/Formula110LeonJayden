@@ -75,37 +75,36 @@ class RacingLineFollowerParams:
     strategy, seeded from a hand-tuned baseline). See LAB_NOTEBOOK.md, Entry 6.
     """
 
-    center_offset_gain: float = 0.04646983645575174
-    heading_error_gain: float = 0.011969058650635005
-    lookahead_near_gain: float = -0.05641812583155188
-    lookahead_far_gain: float = 0.11930633186426046
+    # Entry 13: jointly re-tuned by a damage-aware search (optimize_racing_line_follower.py,
+    # DAMAGE_PENALTY_M penalizing partial damage, not just elimination), then a second
+    # refinement pass specifically retrained against the first pass's own failing seeds.
+    # Validated 30/30 fresh seeds, zero damage, avg 564.0m at 30s rounds (vs. 516.9m before
+    # this entry). See LAB_NOTEBOOK.md.
+    center_offset_gain: float = 0.04154525687804784
+    heading_error_gain: float = -0.012057775890936078
+    lookahead_near_gain: float = -0.009428593547060816
+    lookahead_far_gain: float = 0.2788918510295886
 
-    wall_avoid_margin_m: float = 1.9478186185133812
-    wall_avoid_gain: float = 0.11298311580834951
+    wall_avoid_margin_m: float = 3.036874813299044
+    wall_avoid_gain: float = 0.132305024710858
 
-    emergency_front_m: float = 2.775567055718721
-    emergency_steer: float = 0.7742171195339129
+    emergency_front_m: float = 2.7395885009239636
+    emergency_steer: float = 1.0975507393159756
 
-    recovery_steer: float = 0.17509229333000273
-    recovery_throttle: float = -0.4307810576870986
+    recovery_steer: float = 0.0811836106024439
+    recovery_throttle: float = -0.47491893778009936
 
-    steer_limit: float = 1.3143862095626797
+    steer_limit: float = 1.531423211205723
 
-    speed_gain: float = 0.2279368992608865
-    brake_lead_time_s: float = 0.14049539154367582
-    brake_min_distance_m: float = 0.14169744492358835
-    brake_gain: float = 2.113623025002169
+    speed_gain: float = 0.137015673230773
+    brake_lead_time_s: float = 0.1472430846621338
+    brake_min_distance_m: float = 0.1941135295338738
+    brake_gain: float = 1.0166067447004992
 
     # Flat throttle target overriding the racing line's own speed profile - this
     # simulator's grip makes flat-out driving faster than curvature-based
     # slowdown (see LAB_NOTEBOOK.md Entry 5), so speed is tuned here instead.
-    # 17.0 m/s is the measured zero-damage ceiling on this line (20/20 seeds,
-    # see LAB_NOTEBOOK.md Entry 6): a hillclimb search pushed this to ~23 m/s,
-    # which drives with real wall damage every race (survives narrowly under
-    # privileged ground-truth tracking) and does not survive distillation to a
-    # sensor-only policy (7/25 held-out). Value chosen with the same
-    # zero-damage safety margin as the shipped reactive/BC controllers.
-    flat_speed_mps: float = 17.0
+    flat_speed_mps: float = 18.476229312042772
 
 
 DEFAULT_FOLLOWER_PARAMS = RacingLineFollowerParams()
