@@ -26,6 +26,13 @@ OUTPUT_SIZE = 2
 WALL_LIDAR_CAP_M = 15.0
 CENTER_OFFSET_CAP_M = 3.3
 LOOKAHEAD_OFFSET_CAP_M = 3.3
+# Matches the shipped src/controllers/learned_policy.pt (Entry 14, trained at
+# HIDDEN_SIZE=8, SPEED_CAP_MPS=20.0). Entry 17 tried HIDDEN_SIZE=20 and
+# SPEED_CAP_MPS=40.0 (to remove speed-input saturation for a much-higher-speed
+# expert) - fixed the eliminations from Entry 16 but still landed below the
+# shipped baseline (518.0m vs 568.0m), so not adopted; see LAB_NOTEBOOK.md.
+# IMPORTANT: HIDDEN_SIZE must match whatever learned_policy.pt was trained
+# with, or Controller.__init__'s load_state_dict will fail on a shape mismatch.
 SPEED_CAP_MPS = 20.0
 
 WEIGHTS_PATH = Path(__file__).with_name("learned_policy.pt")

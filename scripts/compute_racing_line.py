@@ -152,11 +152,18 @@ def main() -> None:
         help="Override the curvature-limited profile with a constant target speed (this simulator's grip makes "
         "flat-out driving faster than slowing for corners - see LAB_NOTEBOOK.md Entry 3 and 5)",
     )
+    parser.add_argument(
+        "--wall-safety-margin-m",
+        type=float,
+        default=WALL_SAFETY_MARGIN_M,
+        help="Buffer between the theoretical minimum-curvature line and the wall - smaller allows a tighter "
+        "apex cut (more offset, less curvature) at the cost of less tracking-error margin for the follower.",
+    )
     args = parser.parse_args()
 
     model = default_track_progress_model()
     half_width = vehicle_collision_bounds(FORMULA_VEHICLE_PHYSICS_CONFIG).half_width
-    max_offset_m = TRACK_WIDTH / 2.0 - half_width - WALL_SAFETY_MARGIN_M
+    max_offset_m = TRACK_WIDTH / 2.0 - half_width - args.wall_safety_margin_m
 
     xs = [point.x for point in model.points]
     zs = [point.z for point in model.points]

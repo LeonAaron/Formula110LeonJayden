@@ -89,8 +89,11 @@ def run_search(
     seeds: tuple[int, ...],
     round_seconds: float,
     rng_seed: int,
+    racing_line_path: str | None = None,
 ) -> tuple[RacingLineFollowerParams, float]:
-    racing_line = load_racing_line()
+    from pathlib import Path
+
+    racing_line = load_racing_line(Path(racing_line_path)) if racing_line_path else load_racing_line()
     rng = random.Random(rng_seed)
     base_genome = genome_from_params(DEFAULT_FOLLOWER_PARAMS)
     population = [base_genome] + [
@@ -151,6 +154,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, nargs="+", default=[13, 55, 87])
     parser.add_argument("--round-seconds", type=float, default=20.0)
     parser.add_argument("--rng-seed", type=int, default=1)
+    parser.add_argument("--racing-line", type=str, default=None, help="Override racing line .pt path")
     args = parser.parse_args()
 
     best_params, best_fitness = run_search(
@@ -161,6 +165,7 @@ def main() -> None:
         seeds=tuple(args.seeds),
         round_seconds=args.round_seconds,
         rng_seed=args.rng_seed,
+        racing_line_path=args.racing_line,
     )
     print("-" * 72)
     print(f"best fitness: {best_fitness:.1f}m")

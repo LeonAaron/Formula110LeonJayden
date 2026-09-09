@@ -455,3 +455,83 @@ Entry 7's rejected candidate had a real ~2-3% distance gain (454.1 m mean) under
 - 30 validation seeds (round 3) and 25 held-out seeds (final network validation) is still a finite sample; the same "looks safe, diagnose failures, retrain against them" loop used for round 2 -> round 3 should be repeated if any future validation run surfaces a new failing seed, rather than assuming 0/30 and 0/25 generalizes to 0/infinity.
 - 4 laps (~724 m in 30 s) is now within closer reach: 556.9 m at consistently 2-3 laps is roughly 77% of the way there by distance, versus 511 m (70%) before this entry.
 - The same targeted-refinement technique (diagnose specific failing seeds from a faster-but-unsafe candidate, retrain against exactly those) is a reusable pattern for any future speed push on this controller, and is cheaper per iteration than random-restart search since it reuses the fast candidate's already-correct behavior on the seeds it *does* handle well.
+
+## Entry 16 — Anticipatory Accel/Decel: Works at the Follower Level, Fails to Distill
+
+**Date and time:** September 8, 2026 (continued)
+
+**Question or objective:** Prior corner-speed attempts this session used `heading_error_degrees` (the car's *current* misalignment) as the slowdown signal and found it useless twice - the search always neutralized it, because by the time heading error is large the car is already mid-corner, too late on a track with corners this close together. Would an *anticipatory* signal - the far camera lookahead point (`camera.lookahead_offsets_m[-1]`, 16 m ahead, ~1 s of lead time at these speeds) instead of the current-instant one - give real advance braking distance and let straight-line speed rise well above the ~19 m/s ceiling every prior entry converged to?
+
+**What we investigated or changed:**
+- Added `lookahead_speed_gain` to `RacingLineFollowerParams`/`follow()`: `target_speed_mps = max(min_corner_speed_mps, flat_speed_mps - lookahead_speed_gain * abs(far_lookahead_offset_m))`, defaulting to 0 (inert, same as every prior flat-speed entry).
+- Search seeded aggressively (`flat_speed_mps=27`, `lookahead_speed_gain=3.0`, `min_corner_speed_mps=14`), population 10, generations 8, 4 training seeds, 15 s rounds (one ~3-minute chunk): fitness rose 217.6 m -> 280.8 m and, unlike every `corner_speed_gain` attempt, the term was **not** neutralized this time - converged to `flat_speed_mps=37.9`, `lookahead_speed_gain=2.97`, `min_corner_speed_mps=21.3`.
+- Validated the raw candidate on 15 fresh seeds: **avg 602.0 m, 0/15 eliminated**, but 2 seeds took minor damage (0.14, 0.08) - a genuine, large jump (vs. 578-586 m from every prior entry) but not yet zero-damage.
+- Ran a targeted refinement (same technique as Entry 13's round 3) against the two failing seeds plus two known-good ones: training fitness rose 346.4 m -> 363.5 m, converging to a more conservative `flat_speed_mps=31.9`, `lookahead_speed_gain=2.26`. Validated head-to-head against the original candidate on the *same* 20 fresh seeds: refined candidate **546.6 m avg, max damage 0.02** (safer, slower) vs. original candidate **591.8 m avg, max damage 0.17, still 0/20 eliminated** (faster, a bit riskier). Chose the faster one given the session's explicit 600 m target and hard time budget - not a zero-damage result, an explicit speed/safety tradeoff made under time pressure.
+- Regenerated demonstrations and retrained BC on the faster candidate. **Training MSE converged to 0.036 - roughly 180x every prior entry's ~0.0002.**
+
+**Evidence:**
+- Experiment output: two search rounds (initial + targeted refinement) and three raw-follower validation passes (15, 20, 20 fresh seeds); one full held-out validation of the distilled network via `validate_policy.py` across `(42, 110, 271, 997, 2027)`.
+- Commits or code: `scripts/racing_line_follower.py` (`lookahead_speed_gain` mechanism added, left at 0/inert in the shipped `DEFAULT_FOLLOWER_PARAMS` - the working params are recorded here, not in code, since they were not shipped), `artifacts/racing_line_demonstrations_v7.pt`, `artifacts/racing_line_bc_policy_v7.pt` (not shipped).
+
+**What we observed:**
+- Held-out validation of the distilled network: **24/25 survived (one full elimination), avg scored distance 484.5 m** - *worse* than the 568.0 m already shipped from Entry 14, despite the raw expert being dramatically better (591.8 m raw vs. Entry 14's ~578 m raw).
+- The training-MSE jump (0.0002 -> 0.036) is the direct explanation: every prior expert's throttle command was a near-constant function of the sensors (flat speed target, minor brake-distance reactions), easy for a ~140-parameter, 8-hidden-unit network to imitate almost exactly. This expert's throttle now swings from full acceleration toward 38 m/s down to a much lower cornering speed based on a lookahead signal - a genuinely higher-variance function of the input - and the same small network could not fit it closely enough to reproduce the expert's precise brake-timing, so small execution errors during autonomous rollout compound into real wall contact (exactly the covariate-shift risk flagged as an open item since Entry 11).
+- This is a clean, mechanistic explanation for why the same "raise flat speed" lever worked cheaply through Entries 12-15 (near-constant target, low-variance expert, easy to distill) but broke down here (highly-variable target, high-variance expert, hard to distill) - the anticipatory mechanism itself is sound (591.8 m raw, 0 eliminations), but this network's capacity is the actual bottleneck now, not the follower's driving policy.
+
+**Decision and rationale:** Did **not** ship `racing_line_bc_policy_v7.pt` - it is a regression versus the already-shipped Entry 14 policy on every metric that matters (survival and distance both worse). Reverted `scripts/racing_line_follower.py`'s `DEFAULT_FOLLOWER_PARAMS` to exactly match what is shipped (Entry 14's values) so the script and the deployed weights stay consistent; `src/controllers/learned_policy.pt` remains Entry 14's 568.0 m, 25/25-safe checkpoint. The working (raw-follower-only) anticipatory-braking parameters are preserved in this entry's text for reuse.
+
+**Next steps:**
+- The bottleneck is now demonstrably the network, not the driving policy: either widen `PolicyNet` (`HIDDEN_SIZE` beyond 8) to give the BC step enough capacity to fit a higher-variance expert, or apply DAgger (flagged since Entry 11) so training data comes from the *network's own* rollout states rather than only the expert's, which specifically targets exactly this kind of imitation gap.
+- The refined (slower, `flat_speed_mps=31.9`) raw candidate was never distilled or validated end-to-end - if a wider network or DAgger fixes the imitation gap, try distilling the *refined* candidate first, since it is closer to zero-damage at the raw-follower level (max damage 0.02 vs. 0.17) and would need less of the network's precision budget spent on recovering from close calls.
+- 600 m raw is achieved and validated at the follower level (602.0 m); the remaining problem is entirely "teach a 140-parameter sensor-only network to reproduce it," not "find a faster driving policy" - future sessions should treat those as separate, sequential problems rather than re-running the same follower search again.
+
+## Entry 17 — Widening the Network Fixes the Crashes, Not the Speed Deficit
+
+**Date and time:** September 8, 2026 (continued)
+
+**Question or objective:** Entry 16 found the fast (591.8 m raw) anticipatory-braking expert didn't distill safely (24/25 held-out, one elimination). Two suspects: (1) `PolicyNet`'s `HIDDEN_SIZE=8` (~140 total parameters) may be too small to fit the expert's now much higher-variance throttle behavior, and (2) `SPEED_CAP_MPS=20.0` in `build_inputs`'s speed-feature normalization - the expert reaches ~34 m/s, so every speed reading above 20 m/s was clamped to the same input value 1.0, making the network blind to its own speed across most of its actual operating range. Fixing both, does the distilled network now match the raw expert's 591.8 m?
+
+**What we investigated or changed:**
+- Raised `HIDDEN_SIZE` 8 -> 20 and `SPEED_CAP_MPS` 20.0 -> 40.0 in `src/controllers/learned.py`. Re-applied Entry 16's fast follower params as `DEFAULT_FOLLOWER_PARAMS` (reverted at the end of Entry 16). Regenerated demonstrations (feature vectors depend on `SPEED_CAP_MPS`, so a regenerate was required, not just a retrain) and retrained BC (300 epochs, up from 200, since the harder function needed more optimization).
+- Training MSE improved only modestly: 0.036 (Entry 16, `HIDDEN_SIZE=8`) -> 0.029 (`HIDDEN_SIZE=20`) - a real but small gain, not the order-of-magnitude drop back toward the ~0.0002 baseline that would suggest capacity was the whole story.
+
+**Evidence:**
+- Experiment output: full held-out validation (25 races) via `validate_policy.py` across `(42, 110, 271, 997, 2027)`.
+- Commits or code: `src/controllers/learned.py` (`HIDDEN_SIZE`, `SPEED_CAP_MPS` reverted back to 8/20.0 after this entry - not adopted), `artifacts/racing_line_demonstrations_v8.pt`, `artifacts/racing_line_bc_policy_v8.pt` (not shipped).
+
+**What we observed:**
+- Held-out validation: **25/25 survived, 0 eliminations** (up from Entry 16's 24/25) - the speed-cap fix in particular directly closed the elimination, consistent with the network previously being unable to perceive braking urgency at genuinely high speed. But **average scored distance was only 518.0 m** - worse than both the 600 m target and the already-shipped Entry 14 baseline (568.0 m), and mostly 2-lap finishes rather than the 3-lap finishes the raw 591.8 m expert reaches.
+- This is a new, distinct failure mode from Entry 16's: not crashing, but *slow* - the wider network stopped eliminating but still doesn't reproduce the expert's precise accel/brake timing closely enough, and the resulting small, frequent control errors (visible as occasional 0.08-0.18 damage grazes, and lost time either braking too early or not accelerating cleanly back to speed) cost more net distance than the ~15 m/s higher top speed gains. A `HIDDEN_SIZE` increase from 8 to 20 (roughly 2.5x the parameters) was not enough capacity to close this gap in one shot.
+- Reconfirms Entry 16's core finding from a different angle: the bottleneck is specifically *imitation fidelity* on a high-variance expert, not simply "not enough numbers to represent the function" (more hidden units helped some) or "blind to its own speed" (fixing the cap helped eliminate crashes) - both were real, partial contributors, but neither alone (nor both together, in this one attempt) fully closes the gap to the raw expert's performance.
+
+**Decision and rationale:** Did not ship `racing_line_bc_policy_v8.pt` - still a regression on distance versus the shipped Entry 14 policy, despite being safer than Entry 16's attempt. Reverted `src/controllers/learned.py` and `scripts/racing_line_follower.py` back to exactly the shipped Entry 14 state (confirmed via direct weight comparison before and after) so the repository stays consistent with `src/controllers/learned_policy.pt`, which remains unchanged at 568.0 m, 25/25 safe.
+
+**Next steps:**
+- Two levers were each tried once, together, in one shot; the search space of (hidden size, speed cap, epoch count, learning rate) around the high-variance expert is still unexplored - a wider sweep (e.g. `HIDDEN_SIZE` 32-48, more epochs) might close the remaining gap, but each attempt costs a full regenerate+retrain+validate cycle (~3-4 minutes), so this needs either a longer uninterrupted budget or a way to test multiple hidden sizes in one pass (e.g. train several networks against the same cached demonstrations dataset in one script run, only regenerating demonstrations once).
+- DAgger remains untried and is likely the more fundamentally correct fix (train on the network's own visited states, not just the expert's) rather than continuing to guess at network capacity.
+- The refined (slower, 546.6 m raw, max damage 0.02) candidate from Entry 16 was never distilled either - it may be an easier imitation target than the faster one tried here precisely because its own behavior is lower-variance, and could be worth trying before further widening the network for the faster candidate.
+
+## Entry 14 — A Second Search Pass Under a Hard 15-Minute Budget: Diminishing Returns, Still Safe
+
+**Date and time:** September 8, 2026 (continued)
+
+**Question or objective:** Given a hard 15-minute budget (target: push Entry 13's 556.9 m toward 600 m), does repeating Entry 13's damage-aware search process - seeded from its own result - keep finding gains at a similar rate, or is the follower's steering/speed parameterization approaching a genuine ceiling for this racing line's geometry?
+
+**What we investigated or changed:**
+- Ran four successive `scripts/optimize_racing_line_follower.py` search rounds, each seeded from `DEFAULT_FOLLOWER_PARAMS`, varying population/generations/mutation-sigma/seed-count to fit short time slices: a narrow-mutation round (sigma 0.2, found +0.4% training fitness, essentially a no-op), a wide-mutation round (sigma 0.35, 12s rounds, found *nothing* better than init over 8 generations), and two moderate rounds (sigma 0.25, matching Entry 13's successful round-2 configuration) - the first found another no-op, the second (different rng seed) found a real +2.6% training gain with a notably different steering strategy (`lookahead_far_gain` 0.28 -> 0.61, `steer_limit` 1.53 -> 1.98, i.e., looking farther ahead with a much less clamped steering response, rather than a pure speed increase).
+- Validated that last candidate on 12 fresh seeds at 30 s (privileged, raw follower): **12/12 survived, zero damage, avg 577.8 m** (vs. 564.0 m raw baseline) - safe, so shipped directly without needing Entry 13's targeted-refinement step this time (no failing seeds to fix).
+- Regenerated demonstrations and retrained BC on the new params (training MSE 0.00020, in line with prior entries).
+
+**Evidence:**
+- Experiment output: four search rounds (`optimize_racing_line_follower.py`, varying flags, all within the session's 15-minute wall-clock budget); 12-seed raw-follower validation; 25-race held-out validation via `scripts/evaluate_controller.py`-equivalent (`validate_policy.py`) across `(42, 110, 271, 997, 2027)`.
+- Commits or code: `scripts/racing_line_follower.py` (`DEFAULT_FOLLOWER_PARAMS` updated again), `artifacts/racing_line_demonstrations_v5.pt`, `artifacts/racing_line_bc_policy_v5.pt` -> `src/controllers/learned_policy.pt`.
+
+**What we observed:**
+- Held-out validation of the new shipped policy: **25/25 survived, 25/25 completed >=2 laps (most at 3 laps), damage = 0.00 in every single one of the 25 races** (even cleaner than Entry 13's 24/25), average scored distance **≈568.0 m per 30 s** - **+11.1 m over Entry 13's 556.9 m**, but well short of the 600 m target requested for this session.
+- Two of the four search rounds this entry found literally nothing better than their seed genome, versus Entry 13 where every round found a usable improvement. This is a measurable slowdown in the rate of return from the same search method on the same line geometry - each successive round is finding a smaller slice of remaining headroom, consistent with approaching (not necessarily at) a real ceiling for this steering-law/line-geometry combination.
+
+**Decision and rationale:** Shipped the round result (`racing_line_bc_policy_v5.pt` -> `src/controllers/learned_policy.pt`) since it is a genuine, fully safe improvement, even though it fell short of the requested 600 m. Did not continue searching with the same method past the 15-minute budget rather than force a result; reporting the shortfall honestly follows the standing practice in this notebook of logging what the time-boxed search actually found rather than only successes.
+
+**Next steps:**
+- Reaching 600 m likely needs a different lever than another round of the same steering/speed search: either a genuinely re-optimized racing line (rerun `compute_racing_line.py` with different curvature-smoothing parameters, not just re-tuning the follower's gains around the existing line), or the DAgger fix flagged in Entries 11-12 to let a higher-speed line survive distillation without the current safety-margin tax.
+- If more search time becomes available, resume from this entry's exact shipped params (not from scratch) - four rounds this entry never regressed below the loaded baseline, so continuing the same seeded-search process is still the correct default, just slower to pay off now than in Entry 13.
