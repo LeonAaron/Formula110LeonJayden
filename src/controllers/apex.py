@@ -22,12 +22,15 @@ Pipeline, every tick, from public sensors only:
 
 from __future__ import annotations
 
+import importlib.util
 import math
+import os
 from dataclasses import dataclass
+from types import ModuleType
 
 import numpy as np
 
-from controllers import apex_plan
+from controllers import apex_plan as _default_plan
 from controllers.apex_map import TrackMap
 from controllers.reactive import DEFAULT_PARAMS as REACTIVE_PARAMS
 from controllers.reactive import drive as reactive_drive
@@ -52,18 +55,32 @@ class ApexParams:
     speed_scale: float = 1.0
     speed_lead_m: float = 1.0
     throttle_gain: float = 0.6
-    brake_max: float = 0.7
+    brake_max: float = 0.6
     # Safety: wall ahead.
-    wall_stop_decel_mps2: float = 22.0
-    wall_stop_margin_m: float = 1.2
+    wall_stop_decel_mps2: float = 35.0
+    wall_stop_margin_m: float = 1.0
+    wall_brake: float = 0.5
     emergency_front_m: float = 2.5
     emergency_steer: float = 0.8
     # Contact recovery.
     recovery_throttle: float = -0.4
     recovery_steer: float = 0.5
-    # Opponent avoidance.
-    opponent_range_m: float = 22.0
+    recovery_speed_mps: float = 4.0
+    contact_steer: float = 0.4
+    contact_throttle: float = 0.3
+    # Opponent avoidance: the racing line is bent around an opponent projected onto the track.
+    opponent_range_m: float = 30.0
     opponent_clearance_m: float = 2.3
+    opponent_window_before_m: float = 30.0
+    opponent_window_after_m: float = 9.0
+    opponent_blend_m: float = 20.0
+    opponent_blend_out_m: float = 8.0
+    opponent_commit_m: float = 16.0
+    opponent_follow_gap_m: float = 10.0
+    opponent_follow_speed_mps: float = 6.0
+    # Recovery state machine (wall contact at low speed): reverse, then drive off.
+    recovery_reverse_s: float = 0.6
+    recovery_forward_s: float = 0.4
     # Localization sanity.
     residual_limit: float = 1.5
 
@@ -71,10 +88,29 @@ class ApexParams:
 DEFAULT_PARAMS = ApexParams()
 
 
+def _load_plan() -> ModuleType:
+    """Load the shipped plan, or an alternative file named by APEX_PLAN_PATH (experiments only)."""
+    path = os.environ.get("APEX_PLAN_PATH")
+    if not path:
+        return _default_plan
+    spec = importlib.util.spec_from_file_location("apex_plan_override", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load plan from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class Controller:
     def __init__(self, params: ApexParams = DEFAULT_PARAMS) -> None:
         self.params = params
         self.map = TrackMap()
+        apex_plan = _load_plan()
+        self.max_offset_m = apex_plan.MAX_OFFSET_M
+        self.a_lat = apex_plan.A_LAT_MPS2
+        self.a_brake = apex_plan.A_BRAKE_MPS2
+        self.pass_profile: tuple[np.ndarray, np.ndarray] | None = None
+        self.pass_basis: tuple[float, float, float] | None = None
         self.plan_step = apex_plan.GRID_STEP_M
         self.plan_length = apex_plan.TRACK_LENGTH_M
         self.offset = np.asarray(apex_plan.OFFSET_M)
@@ -83,6 +119,12 @@ class Controller:
         self.fallback_ticks = 0
         self.last: dict[str, float] = {}
         self.prev_throttle = 0.0
+        self.avoid: dict[str, float] = {}
+        self.pass_side = 0.0  # +1 pass on the left of the opponent, -1 on the right, 0 none
+        self.opponent: tuple[float, float] | None = None  # (s, lateral) of the opponent being avoided
+        self.recovery_phase = 0  # 0 none, 1 reversing, 2 driving forward
+        self.recovery_ticks = 0
+        self.recovery_side = 1.0
 
     # -- plan lookups -----------------------------------------------------
     def _interp(self, table: np.ndarray, s: float) -> float:
@@ -92,19 +134,59 @@ class Controller:
         n = len(table)
         return float(table[index % n] * (1.0 - fraction) + table[(index + 1) % n] * fraction)
 
+    def line_lateral(self, s: float) -> float:
+        """Racing-line lateral offset at s, bent around a registered opponent."""
+        d = self._interp(self.offset, s)
+        if self.opponent is None or self.pass_side == 0.0:
+            return d
+        p = self.params
+        opp_s, opp_lat = self.opponent
+        rel = self.map.signed_delta(s, opp_s)  # positive: s is past the opponent
+        if rel < -p.opponent_window_before_m or rel > p.opponent_window_after_m:
+            return d
+        limit = self.max_offset_m - 0.2
+        required = max(-limit, min(limit, opp_lat + self.pass_side * p.opponent_clearance_m))
+        # Only bend if the line is not already clear on the chosen side.
+        if self.pass_side * (d - required) >= 0.0:
+            return d
+        # Smooth blend in before the opponent and out after it.
+        if rel < -p.opponent_window_before_m + p.opponent_blend_m:
+            weight = (rel + p.opponent_window_before_m) / p.opponent_blend_m
+        elif rel > p.opponent_window_after_m - p.opponent_blend_out_m:
+            weight = (p.opponent_window_after_m - rel) / p.opponent_blend_out_m
+        else:
+            weight = 1.0
+        weight = _clamp(weight, 0.0, 1.0)
+        return d + weight * (required - d)
+
     def line_point(self, s: float) -> tuple[float, float]:
         cx, cz = self.map.center_at(s)
         lx, lz = self.map.left_at(s)
-        d = self._interp(self.offset, s)
+        d = self.line_lateral(s)
         return cx + d * lx, cz + d * lz
+
+    def project(self, x: float, z: float, near_s: float, window_m: float = 40.0) -> tuple[float, float]:
+        """Project a world point onto the centerline near ``near_s``: returns (s, lateral)."""
+        m = self.map
+        delta = np.abs(_wrap_signed(m.s - near_s, m.length_m))
+        mask = delta <= window_m
+        dx = x - m.cx[mask]
+        dz = z - m.cz[mask]
+        # distance along the local normal only counts if the point is beside the sample (not ahead/behind)
+        along = dx * m.fwd_x[mask] + dz * m.fwd_z[mask]
+        dist = np.hypot(dx, dz) + np.abs(along)
+        best = int(np.argmin(dist))
+        lateral = dx[best] * m.left_x[mask][best] + dz[best] * m.left_z[mask][best]
+        return float(m.s[mask][best]), float(lateral)
 
     # -- control ----------------------------------------------------------
     def __call__(self, sensors: RobotSensors) -> RobotCommand:
         p = self.params
         wall = sensors.wall_lidar
-        if sensors.contact.any_contact > 0.0:
-            open_side = -1.0 if wall.left_m > wall.right_m else 1.0
-            return self._command(p.recovery_throttle, open_side * p.recovery_steer)
+        speed_now = sensors.odometry.speed_mps
+        recovery = self._recovery(sensors)
+        if recovery is not None:
+            return recovery
 
         loc = self.map.localize(sensors, None)
         if loc.residual > p.residual_limit:
@@ -126,8 +208,9 @@ class Controller:
         # Pure pursuit target on the racing line.
         lookahead = min(p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0)))
         s_target = s + lookahead
+        self.avoid = {}
+        self._register_opponent(sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m)
         tx, tz = self.line_point(s_target)
-        tx, tz = self._avoid_opponents(sensors, s_target, tx, tz, px, pz, fx, fz, rx, rz)
         dx, dz = tx - px, tz - pz
         ahead = dx * fx + dz * fz
         right = dx * rx + dz * rz
@@ -139,13 +222,27 @@ class Controller:
 
         # Speed target from the profile a little ahead of the car.
         v_target = p.speed_scale * min(self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s))
+        if self.opponent is not None:
+            self._ensure_pass_profile()
+            if self.pass_profile is not None:
+                v_target = min(v_target, self._pass_speed(s + p.speed_lead_m), self._pass_speed(s))
+            opp_s, opp_lat = self.opponent
+            gap_ahead = self.map.signed_delta(opp_s, s)
+            if 0.0 < gap_ahead < p.opponent_follow_gap_m and abs(loc.lateral_m - opp_lat) < p.opponent_clearance_m - 0.8:
+                v_target = min(v_target, p.opponent_follow_speed_mps)
         throttle = (v_target - v) * p.throttle_gain
         throttle = max(-p.brake_max, min(1.0, throttle))
+
+        # Sliding along a wall at speed: steer off it, keep rolling (no brake -> no forced stop).
+        if sensors.contact.wall > 0.0:
+            open_side = -1.0 if wall.left_m > wall.right_m else 1.0
+            steer = open_side * p.contact_steer
+            throttle = min(throttle, p.contact_throttle) if throttle > 0.0 else p.contact_throttle
 
         # Safety: wall directly ahead.
         stop_distance = v * v / (2.0 * p.wall_stop_decel_mps2) + p.wall_stop_margin_m
         if wall.front_m < stop_distance:
-            throttle = min(throttle, -p.brake_max)
+            throttle = min(throttle, -p.wall_brake)
         if wall.front_m < p.emergency_front_m:
             emergency_side = -1.0 if wall.front_left_m > wall.front_right_m else 1.0
             steer += emergency_side * p.emergency_steer
@@ -154,7 +251,8 @@ class Controller:
             "s": s, "lat": loc.lateral_m, "res": loc.residual, "v": v, "v_target": v_target,
             "throttle": throttle, "steer": steer, "front": wall.front_m, "stop": stop_distance,
             "wall_brake": float(wall.front_m < stop_distance), "lookahead": lookahead,
-            "line_lat": self._interp(self.offset, s), "curv": self._interp(self.curvature, s),
+            "line_lat": self.line_lateral(s), "curv": self._interp(self.curvature, s),
+            **{f"avoid_{k}": val for k, val in self.avoid.items()},
         }
         return self._command(throttle, steer)
 
@@ -173,47 +271,150 @@ class Controller:
         self.prev_throttle = throttle
         return RobotCommand(throttle=throttle, steer=_clamp(steer, -1.0, 1.0))
 
-    def _avoid_opponents(
+    def _register_opponent(
         self,
         sensors: RobotSensors,
-        s_target: float,
-        tx: float,
-        tz: float,
+        s: float,
         px: float,
         pz: float,
         fx: float,
         fz: float,
         rx: float,
         rz: float,
-    ) -> tuple[float, float]:
+        lateral: float = 0.0,
+    ) -> None:
+        """Track the nearest opponent ahead, projected onto the track, and pick a passing side once.
+
+        The opponent stays registered (it is static between marshal resets) until the car is past it,
+        even when the camera loses it beside the car, so the bent line never snaps back mid-pass.
+        """
         p = self.params
-        for competitor in sensors.camera.competitors:
-            if competitor.distance_m > p.opponent_range_m or abs(competitor.angle_degrees) > 60.0:
-                continue
-            angle = math.radians(competitor.angle_degrees)
-            ox = px + competitor.distance_m * (math.sin(angle) * rx + math.cos(angle) * fx)
-            oz = pz + competitor.distance_m * (math.sin(angle) * rz + math.cos(angle) * fz)
-            # Lateral gap between the target point and the opponent, measured along the track normal.
-            lx, lz = self.map.left_at(s_target)
-            cx, cz = self.map.center_at(s_target)
-            target_lat = (tx - cx) * lx + (tz - cz) * lz
-            opp_lat = (ox - cx) * lx + (oz - cz) * lz
-            gap = target_lat - opp_lat
-            if abs(gap) >= p.opponent_clearance_m:
-                continue
-            # Move the target to the side of the opponent with more room.
-            limit = apex_plan.MAX_OFFSET_M
-            left_option = opp_lat + p.opponent_clearance_m
-            right_option = opp_lat - p.opponent_clearance_m
-            candidates = [c for c in (left_option, right_option) if abs(c) <= limit]
-            if not candidates:
-                candidates = [max(-limit, min(limit, left_option if opp_lat < 0 else right_option))]
-            new_lat = min(candidates, key=lambda c: abs(c - target_lat))
-            tx, tz = cx + new_lat * lx, cz + new_lat * lz
-        return tx, tz
+        if self.opponent is not None:
+            opp_s, _ = self.opponent
+            if self.map.signed_delta(s, opp_s) > p.opponent_window_after_m:
+                self.opponent = None
+                self.pass_side = 0.0
+                self.pass_profile = None
+                self.pass_basis = None
+        ahead = [
+            c for c in sensors.camera.competitors
+            if c.distance_m <= p.opponent_range_m and abs(c.angle_degrees) <= 90.0
+        ]
+        if not ahead:
+            return
+        competitor = ahead[0]
+        angle = math.radians(competitor.angle_degrees)
+        ox = px + competitor.distance_m * (math.sin(angle) * rx + math.cos(angle) * fx)
+        oz = pz + competitor.distance_m * (math.sin(angle) * rz + math.cos(angle) * fz)
+        opp_s, opp_lat = self.project(ox, oz, s)
+        rel = self.map.signed_delta(opp_s, s)
+        if rel < -p.opponent_window_after_m:
+            return
+        if self.pass_side == 0.0 or self.opponent is None or abs(self.map.signed_delta(opp_s, self.opponent[0])) > 5.0:
+            if rel < p.opponent_commit_m and abs(lateral - opp_lat) > 0.4:
+                # Too close to cross over: pass on the side we are already on.
+                side = 1.0 if lateral > opp_lat else -1.0
+            else:
+                line = self._interp(self.offset, opp_s)
+                options = []
+                for candidate in (1.0, -1.0):
+                    required = opp_lat + candidate * p.opponent_clearance_m
+                    if abs(required) > self.max_offset_m:
+                        continue
+                    options.append((abs(required - line), candidate))
+                side = (1.0 if opp_lat <= 0.0 else -1.0) if not options else min(options)[1]
+            self.pass_side = side
+        self.opponent = (opp_s, opp_lat)
+        self.avoid = {"opp_s": opp_s, "opp_lat": opp_lat, "rel": rel, "side": self.pass_side,
+                      "dist": competitor.distance_m, "angle": competitor.angle_degrees}
+
+    def _ensure_pass_profile(self) -> None:
+        """Build (once per encounter) a grip- and brake-limited speed profile for the bent line."""
+        if self.opponent is None:
+            self.pass_profile = None
+            self.pass_basis = None
+            return
+        opp_s, opp_lat = self.opponent
+        basis = (opp_s, opp_lat, self.pass_side)
+        if self.pass_basis is not None and abs(self.map.signed_delta(opp_s, self.pass_basis[0])) < 0.3 \
+                and abs(opp_lat - self.pass_basis[1]) < 0.3 and self.pass_side == self.pass_basis[2]:
+            return
+        p = self.params
+        step = 0.5
+        s0 = opp_s - p.opponent_window_before_m - 30.0
+        s1 = opp_s + p.opponent_window_after_m + 6.0
+        count = int((s1 - s0) / step) + 1
+        ss = s0 + step * np.arange(count)
+        px = np.empty(count)
+        pz = np.empty(count)
+        for i, value in enumerate(ss):
+            px[i], pz[i] = self.line_point(float(value))
+        tx, tz = np.diff(px), np.diff(pz)
+        seg = np.hypot(tx, tz) + 1e-9
+        heading = np.arctan2(tx, tz)
+        dh = np.diff(heading)
+        dh = (dh + np.pi) % (2 * np.pi) - np.pi
+        kappa = np.abs(dh) / (0.5 * (seg[:-1] + seg[1:]))
+        kappa = np.convolve(kappa, np.ones(3) / 3.0, mode="same")
+        kappa = np.concatenate(([kappa[0]], kappa, [kappa[-1]]))
+        v = np.sqrt(self.a_lat / np.maximum(kappa, 1e-6))
+        plan = np.array([self._interp(self.speed, float(value)) for value in ss])
+        v = np.minimum(v, plan)
+        for i in range(count - 2, -1, -1):
+            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * self.a_brake * step))
+        self.pass_profile = (ss, v)
+        self.pass_basis = basis
+
+    def _pass_speed(self, s: float) -> float:
+        if self.pass_profile is None:
+            return float("inf")
+        ss, v = self.pass_profile
+        rel = self.map.signed_delta(s, float(ss[0]))
+        if rel < 0.0 or rel > float(ss[-1] - ss[0]):
+            return float("inf")
+        position = rel / 0.5
+        index = min(int(position), len(v) - 2)
+        fraction = position - index
+        return float(v[index] * (1.0 - fraction) + v[index + 1] * fraction)
+
+    def _recovery(self, sensors: RobotSensors) -> RobotCommand | None:
+        """Wall contact at low speed: reverse with the nose swinging toward open track, then drive off."""
+        p = self.params
+        wall = sensors.wall_lidar
+        speed = sensors.odometry.speed_mps
+        if self.recovery_phase == 0:
+            if sensors.contact.wall > 0.0 and abs(speed) < p.recovery_speed_mps:
+                self.recovery_phase = 1
+                self.recovery_ticks = 0
+                self.recovery_side = -1.0 if wall.left_m > wall.right_m else 1.0  # side that is open
+            else:
+                return None
+        self.recovery_ticks += 1
+        if self.recovery_phase == 1:
+            if self.recovery_ticks > p.recovery_reverse_s * 60:
+                self.recovery_phase = 2
+                self.recovery_ticks = 0
+                return self._command(0.0, 0.0)
+            # Reversing with the wheels turned toward the wall swings the nose toward open track.
+            return self._command(p.recovery_throttle, -self.recovery_side * p.recovery_steer * 2.0)
+        if self.recovery_ticks > p.recovery_forward_s * 60:
+            self.recovery_phase = 0
+            self.recovery_ticks = 0
+            return None
+        return self._command(0.6, self.recovery_side * p.recovery_steer * 2.0)
+
+
+def _wrap_signed(values: np.ndarray, period: float) -> np.ndarray:
+    return (values + period / 2) % period - period / 2
 
 
 def create_controller() -> Controller:
+    override = os.environ.get("APEX_PARAMS_JSON")  # experiments only
+    if override:
+        import json
+        from dataclasses import replace
+
+        return Controller(replace(DEFAULT_PARAMS, **json.loads(override)))
     return Controller()
 
 

@@ -79,7 +79,7 @@ def _path_energy(
     ds = 0.5 * (seg + torch.roll(seg, -1))
     kappa = dh / ds
     if mode == "curvature":
-        return torch.sum(kappa * kappa * ds)
+        return torch.sum(kappa.abs() ** speed_args.get("power", 2.0) * ds)
     # lap time under the speed model (differentiable version of speed_profile)
     v = torch.clamp(torch.sqrt(speed_args["a_lat"] / torch.clamp(kappa.abs(), min=1e-6)), max=speed_args["v_max"])
     n = len(v)
@@ -196,6 +196,7 @@ def main() -> None:
     parser.add_argument("--a-acc-base", type=float, default=13.0)
     parser.add_argument("--a-acc-slope", type=float, default=0.07)
     parser.add_argument("--a-brake", type=float, default=12.0)
+    parser.add_argument("--power", type=float, default=2.0, help="Exponent on |curvature| in the line objective")
     parser.add_argument("--output", type=Path, default=OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -209,7 +210,7 @@ def main() -> None:
     grid_step_m = track_length_m / len(s)
     speed_args = {
         "a_lat": args.a_lat, "v_max": args.v_max, "a_acc_base": args.a_acc_base,
-        "a_acc_slope": args.a_acc_slope, "a_brake": args.a_brake,
+        "a_acc_slope": args.a_acc_slope, "a_brake": args.a_brake, "power": args.power,
     }
     d = optimize_offsets(
         cx, cz, lx, lz,
@@ -261,12 +262,15 @@ Racing line and speed profile for the default track, sampled every
 {grid_step_m:.4f} m of centerline arc length. See the planner script for the method
 and the parameters used:
 corridor_margin={args.corridor_margin} center_weight={args.center_weight} a_lat={args.a_lat}
-v_max={args.v_max} a_acc_base={args.a_acc_base} a_acc_slope={args.a_acc_slope} a_brake={args.a_brake}
+power={args.power} v_max={args.v_max} a_acc_base={args.a_acc_base} a_acc_slope={args.a_acc_slope} a_brake={args.a_brake}
 """
 
 GRID_STEP_M = {grid_step_m:.8f}
 TRACK_LENGTH_M = {track_length_m:.8f}
 MAX_OFFSET_M = {max_offset_m:.4f}
+A_LAT_MPS2 = {args.a_lat}
+A_BRAKE_MPS2 = {args.a_brake}
+V_MAX_MPS = {args.v_max}
 
 OFFSET_M = {fmt(d)}
 
