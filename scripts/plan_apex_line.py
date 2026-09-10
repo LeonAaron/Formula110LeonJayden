@@ -97,6 +97,20 @@ def _path_energy(
     return torch.sum(ds / vm)
 
 
+def inside_limits(cx: np.ndarray, cz: np.ndarray, *, max_offset_m: float, inside_margin_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-point (left_limit, right_limit) for the offset: the corridor, tightened on the inside of
+    a bend so the offset never reaches the centerline's own centre of curvature (which would fold the
+    path into a cusp). Curvature is smoothed over a few samples first."""
+    kappa, _ = path_curvature(cx, cz)  # positive = turning left
+    kernel = np.ones(7) / 7.0
+    kappa = np.convolve(np.concatenate((kappa[-3:], kappa, kappa[:3])), kernel, mode="valid")
+    radius = 1.0 / np.maximum(np.abs(kappa), 1e-6)
+    inside = np.maximum(0.0, np.minimum(max_offset_m, radius - inside_margin_m))
+    left_limit = np.where(kappa > 0, inside, max_offset_m)   # left turn: left side is the inside
+    right_limit = np.where(kappa < 0, inside, max_offset_m)
+    return left_limit, right_limit
+
+
 def optimize_offsets(
     cx: np.ndarray,
     cz: np.ndarray,
@@ -104,6 +118,7 @@ def optimize_offsets(
     lz: np.ndarray,
     *,
     max_offset_m: float,
+    inside_margin_m: float = 1.5,
     center_weight: float,
     iterations: int,
     mode: str = "curvature",
@@ -117,24 +132,28 @@ def optimize_offsets(
     """
     t = lambda a: torch.tensor(a, dtype=torch.float64)  # noqa: E731
     cxt, czt, lxt, lzt = t(cx), t(cz), t(lx), t(lz)
+    left_limit, right_limit = inside_limits(cx, cz, max_offset_m=max_offset_m, inside_margin_m=inside_margin_m)
+    # d = centre + half_span * tanh(u) maps u onto [-right_limit, +left_limit]
+    centre = t(0.5 * (left_limit - right_limit))
+    half_span = t(0.5 * (left_limit + right_limit))
     if init is None:
         u = torch.zeros(len(cx), dtype=torch.float64, requires_grad=True)
     else:
-        ratio = np.clip(init / max_offset_m, -0.999, 0.999)
+        ratio = np.clip((init - centre.numpy()) / np.maximum(half_span.numpy(), 1e-6), -0.999, 0.999)
         u = torch.tensor(np.arctanh(ratio), dtype=torch.float64, requires_grad=True)
     optimizer = torch.optim.LBFGS([u], lr=0.5, max_iter=iterations, history_size=30, line_search_fn="strong_wolfe")
     args = speed_args or {}
 
     def closure() -> "torch.Tensor":
         optimizer.zero_grad()
-        d = max_offset_m * torch.tanh(u)
+        d = centre + half_span * torch.tanh(u)
         loss = _path_energy(d, cxt, czt, lxt, lzt, mode=mode, speed_args=args) + center_weight * torch.sum(d * d)
         loss.backward()
         return loss
 
     optimizer.step(closure)
     with torch.no_grad():
-        return (max_offset_m * torch.tanh(u)).numpy()
+        return (centre + half_span * torch.tanh(u)).numpy()
 
 
 def path_curvature(px: np.ndarray, pz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -187,7 +206,8 @@ def lap_time(v: np.ndarray, seg: np.ndarray) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corridor-margin", type=float, default=0.7, help="Clearance kept from the barrier face")
+    parser.add_argument("--corridor-margin", type=float, default=0.5, help="Clearance kept from the barrier face")
+    parser.add_argument("--inside-margin", type=float, default=1.5, help="Keep the line this far from a bend's centre of curvature")
     parser.add_argument("--center-weight", type=float, default=1e-6)
     parser.add_argument("--iterations", type=int, default=400)
     parser.add_argument("--mode", choices=("curvature", "laptime", "both"), default="both")
@@ -215,6 +235,7 @@ def main() -> None:
     d = optimize_offsets(
         cx, cz, lx, lz,
         max_offset_m=max_offset_m,
+        inside_margin_m=args.inside_margin,
         center_weight=args.center_weight,
         iterations=args.iterations,
         mode="curvature",
@@ -229,6 +250,7 @@ def main() -> None:
         d = optimize_offsets(
             cx, cz, lx, lz,
             max_offset_m=max_offset_m,
+            inside_margin_m=args.inside_margin,
             center_weight=args.center_weight,
             iterations=args.iterations // 4,
             mode="laptime",
@@ -247,7 +269,7 @@ def main() -> None:
     print(
         f"max|d|={np.max(np.abs(d)):.2f} frac_at_wall={np.mean(np.abs(d) > max_offset_m - 1e-6):.2f} | "
         f"corridor +/-{max_offset_m:.2f} m | path length {total:.1f} m (centerline {track_length_m:.1f}) | "
-        f"min radius {1 / np.max(np.abs(kappa)):.2f} m | speed {v.min():.1f}-{v.max():.1f} m/s | "
+        f"min seg {seg.min():.3f} m | min radius {1 / np.max(np.abs(kappa)):.2f} m | speed {v.min():.1f}-{v.max():.1f} m/s | "
         f"lap time {t_lap:.2f} s -> {30 / t_lap:.2f} laps in 30 s (from a rolling start)"
     )
     if args.dry_run:
@@ -261,7 +283,7 @@ def main() -> None:
 Racing line and speed profile for the default track, sampled every
 {grid_step_m:.4f} m of centerline arc length. See the planner script for the method
 and the parameters used:
-corridor_margin={args.corridor_margin} center_weight={args.center_weight} a_lat={args.a_lat}
+corridor_margin={args.corridor_margin} inside_margin={args.inside_margin} center_weight={args.center_weight} a_lat={args.a_lat}
 power={args.power} v_max={args.v_max} a_acc_base={args.a_acc_base} a_acc_slope={args.a_acc_slope} a_brake={args.a_brake}
 """
 

@@ -46,15 +46,15 @@ MAX_STEER_DEGREES = 25.0
 @dataclass(frozen=True, slots=True)
 class ApexParams:
     # Pure pursuit lookahead: L = clamp(lookahead_time_s * v, min, max)
-    lookahead_time_s: float = 0.32
+    lookahead_time_s: float = 0.5
     lookahead_min_m: float = 3.5
-    lookahead_max_m: float = 12.0
+    lookahead_max_m: float = 16.0
     # Feed a fraction of the line's curvature at the car as steering feedforward.
     curvature_feedforward: float = 0.0
     # Speed profile scaling and tracking.
     speed_scale: float = 1.0
     speed_lead_m: float = 1.0
-    throttle_gain: float = 0.6
+    throttle_gain: float = 1.0
     brake_max: float = 0.6
     # Safety: wall ahead.
     wall_stop_decel_mps2: float = 35.0
@@ -222,6 +222,8 @@ class Controller:
 
         # Speed target from the profile a little ahead of the car.
         v_target = p.speed_scale * min(self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s))
+        plan_target = v_target
+        follow_active = 0.0
         if self.opponent is not None:
             self._ensure_pass_profile()
             if self.pass_profile is not None:
@@ -230,6 +232,7 @@ class Controller:
             gap_ahead = self.map.signed_delta(opp_s, s)
             if 0.0 < gap_ahead < p.opponent_follow_gap_m and abs(loc.lateral_m - opp_lat) < p.opponent_clearance_m - 0.8:
                 v_target = min(v_target, p.opponent_follow_speed_mps)
+                follow_active = 1.0
         throttle = (v_target - v) * p.throttle_gain
         throttle = max(-p.brake_max, min(1.0, throttle))
 
@@ -252,6 +255,7 @@ class Controller:
             "throttle": throttle, "steer": steer, "front": wall.front_m, "stop": stop_distance,
             "wall_brake": float(wall.front_m < stop_distance), "lookahead": lookahead,
             "line_lat": self.line_lateral(s), "curv": self._interp(self.curvature, s),
+            "plan_target": plan_target, "follow": follow_active,
             **{f"avoid_{k}": val for k, val in self.avoid.items()},
         }
         return self._command(throttle, steer)
@@ -340,23 +344,35 @@ class Controller:
                 and abs(opp_lat - self.pass_basis[1]) < 0.3 and self.pass_side == self.pass_basis[2]:
             return
         p = self.params
-        step = 0.5
-        s0 = opp_s - p.opponent_window_before_m - 30.0
-        s1 = opp_s + p.opponent_window_after_m + 6.0
-        count = int((s1 - s0) / step) + 1
-        ss = s0 + step * np.arange(count)
-        px = np.empty(count)
-        pz = np.empty(count)
-        for i, value in enumerate(ss):
-            px[i], pz[i] = self.line_point(float(value))
-        tx, tz = np.diff(px), np.diff(pz)
-        seg = np.hypot(tx, tz) + 1e-9
-        heading = np.arctan2(tx, tz)
-        dh = np.diff(heading)
-        dh = (dh + np.pi) % (2 * np.pi) - np.pi
-        kappa = np.abs(dh) / (0.5 * (seg[:-1] + seg[1:]))
-        kappa = np.convolve(kappa, np.ones(3) / 3.0, mode="same")
-        kappa = np.concatenate(([kappa[0]], kappa, [kappa[-1]]))
+        # Sample on the planner's own grid so the unbent sections reproduce the plan's curvature exactly
+        # (the track normals are piecewise constant, so off-grid resampling would invent kinks).
+        step = self.plan_step
+        first = int(math.floor((opp_s - p.opponent_window_before_m - 30.0) / step))
+        last = int(math.ceil((opp_s + p.opponent_window_after_m + 6.0) / step))
+        count = last - first + 1
+        ss = (first + np.arange(count)) * step
+        def sampled_curvature(lateral: list[float]) -> np.ndarray:
+            px = np.empty(count)
+            pz = np.empty(count)
+            for i, value in enumerate(ss):
+                cx, cz = self.map.center_at(float(value))
+                lx, lz = self.map.left_at(float(value))
+                px[i], pz[i] = cx + lateral[i] * lx, cz + lateral[i] * lz
+            tx, tz = np.diff(px), np.diff(pz)
+            seg = np.hypot(tx, tz) + 1e-9
+            heading = np.arctan2(tx, tz)
+            dh = np.diff(heading)
+            dh = (dh + np.pi) % (2 * np.pi) - np.pi
+            kappa = np.abs(dh) / (0.5 * (seg[:-1] + seg[1:]))
+            return np.concatenate(([kappa[0]], kappa, [kappa[-1]]))
+
+        # The bend's extra curvature is measured as a difference against the unbent line sampled the
+        # same way, then added to the planner's own curvature, so unbent sections keep the plan speed
+        # exactly (the sampled centerline has kinks that would otherwise look like curvature).
+        bent = sampled_curvature([self.line_lateral(float(value)) for value in ss])
+        unbent = sampled_curvature([self._interp(self.offset, float(value)) for value in ss])
+        plan_kappa = np.array([abs(self._interp(self.curvature, float(value))) for value in ss])
+        kappa = np.maximum(plan_kappa, plan_kappa + (bent - unbent))
         v = np.sqrt(self.a_lat / np.maximum(kappa, 1e-6))
         plan = np.array([self._interp(self.speed, float(value)) for value in ss])
         v = np.minimum(v, plan)
@@ -372,7 +388,7 @@ class Controller:
         rel = self.map.signed_delta(s, float(ss[0]))
         if rel < 0.0 or rel > float(ss[-1] - ss[0]):
             return float("inf")
-        position = rel / 0.5
+        position = rel / self.plan_step
         index = min(int(position), len(v) - 2)
         fraction = position - index
         return float(v[index] * (1.0 - fraction) + v[index + 1] * fraction)
