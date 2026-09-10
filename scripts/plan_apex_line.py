@@ -102,9 +102,14 @@ def inside_limits(cx: np.ndarray, cz: np.ndarray, *, max_offset_m: float, inside
     a bend so the offset never reaches the centerline's own centre of curvature (which would fold the
     path into a cusp). Curvature is smoothed over a few samples first."""
     kappa, _ = path_curvature(cx, cz)  # positive = turning left
-    kernel = np.ones(7) / 7.0
-    kappa = np.convolve(np.concatenate((kappa[-3:], kappa, kappa[:3])), kernel, mode="valid")
-    radius = 1.0 / np.maximum(np.abs(kappa), 1e-6)
+    # Conservative: use the sharpest curvature within +/-3 samples (the sampled centerline is a
+    # polyline whose bends concentrate at vertices, so an average would hide them).
+    padded = np.concatenate((kappa[-3:], kappa, kappa[:3]))
+    windows = np.stack([padded[i : i + len(kappa)] for i in range(7)])
+    magnitude = np.max(np.abs(windows), axis=0)
+    sign = np.sign(np.sum(windows, axis=0))
+    kappa = sign * magnitude
+    radius = 1.0 / np.maximum(magnitude, 1e-6)
     inside = np.maximum(0.0, np.minimum(max_offset_m, radius - inside_margin_m))
     left_limit = np.where(kappa > 0, inside, max_offset_m)   # left turn: left side is the inside
     right_limit = np.where(kappa < 0, inside, max_offset_m)
@@ -257,6 +262,7 @@ def main() -> None:
             speed_args=speed_args,
             init=None if args.mode == "laptime" else d_curv,
         )
+    left_limit, right_limit = inside_limits(cx, cz, max_offset_m=max_offset_m, inside_margin_m=args.inside_margin)
     px, pz = cx + d * lx, cz + d * lz
     kappa, seg = path_curvature(px, pz)
     v = speed_profile(
@@ -299,6 +305,12 @@ OFFSET_M = {fmt(d)}
 SPEED_MPS = {fmt(v)}
 
 CURVATURE = {fmt(kappa)}
+
+# Per-point lateral limits (metres): how far left / right of the centerline the car centre may go
+# without folding into the bend's centre of curvature or leaving the corridor.
+LEFT_LIMIT_M = {fmt(left_limit)}
+
+RIGHT_LIMIT_M = {fmt(right_limit)}
 '''
     args.output.write_text(body)
     print(f"wrote {args.output}")

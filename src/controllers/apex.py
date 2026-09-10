@@ -51,6 +51,7 @@ class ApexParams:
     lookahead_max_m: float = 16.0
     # Feed a fraction of the line's curvature at the car as steering feedforward.
     curvature_feedforward: float = 0.0
+    lateral_gain: float = 0.0
     # Speed profile scaling and tracking.
     speed_scale: float = 1.0
     speed_lead_m: float = 1.0
@@ -70,14 +71,20 @@ class ApexParams:
     contact_throttle: float = 0.3
     # Opponent avoidance: the racing line is bent around an opponent projected onto the track.
     opponent_range_m: float = 30.0
-    opponent_clearance_m: float = 2.3
-    opponent_window_before_m: float = 30.0
-    opponent_window_after_m: float = 9.0
+    opponent_clearance_m: float = 2.7
+    pass_grip_fraction: float = 0.7
+    opponent_window_before_m: float = 40.0
+    opponent_window_after_m: float = 14.0
     opponent_blend_m: float = 20.0
-    opponent_blend_out_m: float = 8.0
+    opponent_blend_out_m: float = 14.0
     opponent_commit_m: float = 16.0
+    opponent_lookahead_max_m: float = 9.0
+    opponent_edge_margin_m: float = 0.6
     opponent_follow_gap_m: float = 10.0
     opponent_follow_speed_mps: float = 6.0
+    follow_brake: float = 0.35
+    pass_brake_mps2: float = 9.0
+    pass_brake_max: float = 0.4
     # Recovery state machine (wall contact at low speed): reverse, then drive off.
     recovery_reverse_s: float = 0.6
     recovery_forward_s: float = 0.4
@@ -116,6 +123,13 @@ class Controller:
         self.offset = np.asarray(apex_plan.OFFSET_M)
         self.speed = np.asarray(apex_plan.SPEED_MPS)
         self.curvature = np.asarray(apex_plan.CURVATURE)
+        self.left_limit = np.asarray(apex_plan.LEFT_LIMIT_M)
+        self.right_limit = np.asarray(apex_plan.RIGHT_LIMIT_M)
+        # Heavily smoothed plan lateral (about 4.5 m): the bend deviation is defined against this so
+        # that its second derivative (used for the pass speed) stays free of the plan's fine detail.
+        kernel = np.ones(9) / 9.0
+        padded = np.concatenate((self.offset[-4:], self.offset, self.offset[:4]))
+        self.offset_smooth = np.convolve(padded, kernel, mode="valid")
         self.fallback_ticks = 0
         self.last: dict[str, float] = {}
         self.prev_throttle = 0.0
@@ -144,12 +158,16 @@ class Controller:
         rel = self.map.signed_delta(s, opp_s)  # positive: s is past the opponent
         if rel < -p.opponent_window_before_m or rel > p.opponent_window_after_m:
             return d
-        limit = self.max_offset_m - 0.2
-        required = max(-limit, min(limit, opp_lat + self.pass_side * p.opponent_clearance_m))
-        # Only bend if the line is not already clear on the chosen side.
-        if self.pass_side * (d - required) >= 0.0:
+        required = self._clip_lateral(opp_lat + self.pass_side * p.opponent_clearance_m, s, margin=p.opponent_edge_margin_m)
+        smooth = self._interp(self.offset_smooth, s)
+        # Deviation needed on the chosen side, measured against the smoothed plan lateral, through a
+        # soft rectifier (width ~1 m) so the deviation stays C2 where the plan line crosses the
+        # required lateral (a hard max() would put a curvature spike there).
+        gap = self.pass_side * (required - smooth)
+        needed = _softplus(gap, 1.0)
+        if needed <= 0.02:
             return d
-        # Smooth blend in before the opponent and out after it.
+        # Smooth (C1) blend in before the opponent and out after it.
         if rel < -p.opponent_window_before_m + p.opponent_blend_m:
             weight = (rel + p.opponent_window_before_m) / p.opponent_blend_m
         elif rel > p.opponent_window_after_m - p.opponent_blend_out_m:
@@ -157,7 +175,12 @@ class Controller:
         else:
             weight = 1.0
         weight = _clamp(weight, 0.0, 1.0)
-        return d + weight * (required - d)
+        weight = weight * weight * (3.0 - 2.0 * weight)
+        return d + weight * self.pass_side * needed
+
+    def _clip_lateral(self, lateral: float, s: float, margin: float = 0.2) -> float:
+        """Clip a lateral offset to the per-point limits (corridor and bend-inside fold limit)."""
+        return max(-self._interp(self.right_limit, s) + margin, min(self._interp(self.left_limit, s) - margin, lateral))
 
     def line_point(self, s: float) -> tuple[float, float]:
         cx, cz = self.map.center_at(s)
@@ -205,11 +228,15 @@ class Controller:
         lx, lz = self.map.left_at(s)
         px, pz = cx + loc.lateral_m * lx, cz + loc.lateral_m * lz
 
-        # Pure pursuit target on the racing line.
-        lookahead = min(p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0)))
-        s_target = s + lookahead
+        # Opponent bookkeeping first: it can shorten the lookahead and bend the line.
         self.avoid = {}
         self._register_opponent(sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m)
+
+        # Pure pursuit target on the racing line.
+        lookahead = min(p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0)))
+        if self.opponent is not None and -25.0 <= self.map.signed_delta(self.opponent[0], s) <= 6.0:
+            lookahead = min(lookahead, p.opponent_lookahead_max_m)
+        s_target = s + lookahead
         tx, tz = self.line_point(s_target)
         dx, dz = tx - px, tz - pz
         ahead = dx * fx + dz * fz
@@ -219,6 +246,8 @@ class Controller:
         if p.curvature_feedforward:
             curvature_cmd += -p.curvature_feedforward * self._interp(self.curvature, s)
         steer = math.degrees(math.atan(WHEELBASE_M * curvature_cmd)) / MAX_STEER_DEGREES
+        if p.lateral_gain:
+            steer -= p.lateral_gain * (self.line_lateral(s) - loc.lateral_m)
 
         # Speed target from the profile a little ahead of the car.
         v_target = p.speed_scale * min(self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s))
@@ -233,8 +262,17 @@ class Controller:
             if 0.0 < gap_ahead < p.opponent_follow_gap_m and abs(loc.lateral_m - opp_lat) < p.opponent_clearance_m - 0.8:
                 v_target = min(v_target, p.opponent_follow_speed_mps)
                 follow_active = 1.0
-        throttle = (v_target - v) * p.throttle_gain
-        throttle = max(-p.brake_max, min(1.0, throttle))
+        # Throttle: the plan's own braking is never limited; extra braking asked for by the pass
+        # zone or the follow rule is capped (gently, and by the friction circle at the current
+        # position, since an opponent hidden behind a barrier can be discovered mid-corner).
+        plan_throttle = max(-p.brake_max, min(1.0, (plan_target - v) * p.throttle_gain))
+        pass_throttle = max(-p.brake_max, min(1.0, (v_target - v) * p.throttle_gain))
+        if follow_active:
+            extra_cap = p.follow_brake
+        else:
+            lateral_use = _clamp(v * v * abs(self._interp(self.curvature, s)) / self.a_lat, 0.0, 1.0)
+            extra_cap = p.pass_brake_max * (1.0 - lateral_use * lateral_use)
+        throttle = min(plan_throttle, max(pass_throttle, -extra_cap))
 
         # Sliding along a wall at speed: steer off it, keep rolling (no brake -> no forced stop).
         if sensors.contact.wall > 0.0:
@@ -245,7 +283,8 @@ class Controller:
         # Safety: wall directly ahead.
         stop_distance = v * v / (2.0 * p.wall_stop_decel_mps2) + p.wall_stop_margin_m
         if wall.front_m < stop_distance:
-            throttle = min(throttle, -p.wall_brake)
+            # Braking hard while steering hard costs front grip; keep it light when already turning.
+            throttle = min(throttle, -p.wall_brake if abs(steer) < 0.5 else -0.25)
         if wall.front_m < p.emergency_front_m:
             emergency_side = -1.0 if wall.front_left_m > wall.front_right_m else 1.0
             steer += emergency_side * p.emergency_steer
@@ -319,14 +358,21 @@ class Controller:
                 # Too close to cross over: pass on the side we are already on.
                 side = 1.0 if lateral > opp_lat else -1.0
             else:
-                line = self._interp(self.offset, opp_s)
                 options = []
                 for candidate in (1.0, -1.0):
-                    required = opp_lat + candidate * p.opponent_clearance_m
-                    if abs(required) > self.max_offset_m:
-                        continue
-                    options.append((abs(required - line), candidate))
+                    required = self._clip_lateral(
+                        opp_lat + candidate * p.opponent_clearance_m, opp_s, margin=p.opponent_edge_margin_m
+                    )
+                    if abs(required - opp_lat) < p.opponent_clearance_m - 0.4:
+                        continue  # not enough room on that side
+                    # Simulate the bent line's speed profile on this side and score its time loss.
+                    self.opponent = (opp_s, opp_lat)
+                    self.pass_side = candidate
+                    self.pass_basis = None
+                    self._ensure_pass_profile()
+                    options.append((self._pass_time_loss() + 0.3 * max(0.0, abs(required) - 2.5), candidate))
                 side = (1.0 if opp_lat <= 0.0 else -1.0) if not options else min(options)[1]
+                self.pass_basis = None
             self.pass_side = side
         self.opponent = (opp_s, opp_lat)
         self.avoid = {"opp_s": opp_s, "opp_lat": opp_lat, "rel": rel, "side": self.pass_side,
@@ -351,35 +397,41 @@ class Controller:
         last = int(math.ceil((opp_s + p.opponent_window_after_m + 6.0) / step))
         count = last - first + 1
         ss = (first + np.arange(count)) * step
-        def sampled_curvature(lateral: list[float]) -> np.ndarray:
-            px = np.empty(count)
-            pz = np.empty(count)
-            for i, value in enumerate(ss):
-                cx, cz = self.map.center_at(float(value))
-                lx, lz = self.map.left_at(float(value))
-                px[i], pz[i] = cx + lateral[i] * lx, cz + lateral[i] * lz
-            tx, tz = np.diff(px), np.diff(pz)
-            seg = np.hypot(tx, tz) + 1e-9
-            heading = np.arctan2(tx, tz)
-            dh = np.diff(heading)
-            dh = (dh + np.pi) % (2 * np.pi) - np.pi
-            kappa = np.abs(dh) / (0.5 * (seg[:-1] + seg[1:]))
-            return np.concatenate(([kappa[0]], kappa, [kappa[-1]]))
-
-        # The bend's extra curvature is measured as a difference against the unbent line sampled the
-        # same way, then added to the planner's own curvature, so unbent sections keep the plan speed
-        # exactly (the sampled centerline has kinks that would otherwise look like curvature).
-        bent = sampled_curvature([self.line_lateral(float(value)) for value in ss])
-        unbent = sampled_curvature([self._interp(self.offset, float(value)) for value in ss])
-        plan_kappa = np.array([abs(self._interp(self.curvature, float(value))) for value in ss])
-        kappa = np.maximum(plan_kappa, plan_kappa + (bent - unbent))
+        # Curvature of the bent line from the plan line's curvature and the smooth lateral deviation
+        # delta(s) (positive = left): kappa = (kappa_plan + delta'') / (1 - kappa_plan * delta).
+        # delta is a smooth blend, so its finite-difference second derivative is well behaved,
+        # unlike curvature sampled from the kinked polyline centerline.
+        delta = np.array([self.line_lateral(float(value)) - self._interp(self.offset, float(value)) for value in ss])
+        plan_kappa = np.array([self._interp(self.curvature, float(value)) for value in ss])
+        second = np.zeros(count)
+        second[1:-1] = (delta[2:] - 2.0 * delta[1:-1] + delta[:-2]) / (step * step)
+        denominator = np.maximum(1.0 - plan_kappa * delta, 0.3)
+        kappa = np.abs((plan_kappa + second) / denominator)
         v = np.sqrt(self.a_lat / np.maximum(kappa, 1e-6))
         plan = np.array([self._interp(self.speed, float(value)) for value in ss])
         v = np.minimum(v, plan)
+        # Near the opponent, leave grip in reserve so the car actually tracks the bent line
+        # (tracking error grows quickly at the cornering limit).
+        rel = np.array([self.map.signed_delta(float(value), opp_s) for value in ss])
+        near = (rel >= -25.0) & (rel <= 6.0)
+        reserve = np.sqrt(p.pass_grip_fraction * self.a_lat / np.maximum(kappa, 1e-6))
+        v = np.where(near, np.minimum(v, reserve), v)
+        # Backward braking pass with a friction circle: where the plan already uses most of the
+        # lateral grip, little braking is allowed, so slowdowns move back onto straighter track.
+        lateral_use = np.clip((plan * plan * np.abs(plan_kappa)) / self.a_lat, 0.0, 1.0)
+        allowed = p.pass_brake_mps2 * np.clip(1.0 - lateral_use * lateral_use, 0.1, 1.0)
         for i in range(count - 2, -1, -1):
-            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * self.a_brake * step))
+            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * float(allowed[i]) * step))
         self.pass_profile = (ss, v)
         self.pass_basis = basis
+
+    def _pass_time_loss(self) -> float:
+        """Seconds lost to the current pass profile relative to the plan speed."""
+        if self.pass_profile is None:
+            return 0.0
+        ss, v = self.pass_profile
+        plan = np.array([self._interp(self.speed, float(value)) for value in ss])
+        return float(np.sum(self.plan_step * (1.0 / np.maximum(v, 1.0) - 1.0 / plan)))
 
     def _pass_speed(self, s: float) -> float:
         if self.pass_profile is None:
@@ -436,3 +488,10 @@ def create_controller() -> Controller:
 
 def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
+
+
+def _softplus(value: float, width: float) -> float:
+    scaled = value / width
+    if scaled > 30.0:
+        return value
+    return width * math.log1p(math.exp(scaled))
