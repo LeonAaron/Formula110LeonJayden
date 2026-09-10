@@ -28,9 +28,6 @@ import os
 from dataclasses import dataclass
 from types import ModuleType
 
-import numpy as np
-import numpy.typing as npt
-
 from controllers import apex_plan as _default_plan
 from controllers.apex_map import TrackMap
 from controllers.reactive import DEFAULT_PARAMS as REACTIVE_PARAMS
@@ -90,7 +87,10 @@ class ApexParams:
     # Recovery state machine (wall contact at low speed): reverse, then drive off.
     recovery_reverse_s: float = 0.6
     recovery_forward_s: float = 0.4
-    # Localization sanity.
+    # Localization: local search window around the dead-reckoned estimate, global re-search
+    # whenever the local best is implausible, reactive fallback when even that is bad.
+    localize_window_m: float = 5.0
+    relocalize_residual: float = 0.5
     residual_limit: float = 1.5
 
 
@@ -118,20 +118,24 @@ class Controller:
         self.max_offset_m = apex_plan.MAX_OFFSET_M
         self.a_lat = apex_plan.A_LAT_MPS2
         self.a_brake = apex_plan.A_BRAKE_MPS2
-        self.pass_profile: tuple[np.ndarray, np.ndarray] | None = None
+        self.pass_profile: tuple[float, list[float]] | None = (
+            None  # (start s, speeds on the plan grid)
+        )
         self.pass_basis: tuple[float, float, float] | None = None
-        self.plan_step = apex_plan.GRID_STEP_M
-        self.plan_length = apex_plan.TRACK_LENGTH_M
-        self.offset = np.asarray(apex_plan.OFFSET_M)
-        self.speed = np.asarray(apex_plan.SPEED_MPS)
-        self.curvature = np.asarray(apex_plan.CURVATURE)
-        self.left_limit = np.asarray(apex_plan.LEFT_LIMIT_M)
-        self.right_limit = np.asarray(apex_plan.RIGHT_LIMIT_M)
+        self.plan_step: float = apex_plan.GRID_STEP_M
+        self.plan_length: float = apex_plan.TRACK_LENGTH_M
+        self.offset: tuple[float, ...] = tuple(apex_plan.OFFSET_M)
+        self.speed: tuple[float, ...] = tuple(apex_plan.SPEED_MPS)
+        self.curvature: tuple[float, ...] = tuple(apex_plan.CURVATURE)
+        self.left_limit: tuple[float, ...] = tuple(apex_plan.LEFT_LIMIT_M)
+        self.right_limit: tuple[float, ...] = tuple(apex_plan.RIGHT_LIMIT_M)
         # Heavily smoothed plan lateral (about 4.5 m): the bend deviation is defined against this so
         # that its second derivative (used for the pass speed) stays free of the plan's fine detail.
-        kernel = np.ones(9) / 9.0
-        padded = np.concatenate((self.offset[-4:], self.offset, self.offset[:4]))
-        self.offset_smooth = np.convolve(padded, kernel, mode="valid")
+        n = len(self.offset)
+        self.offset_smooth: tuple[float, ...] = tuple(
+            sum(self.offset[(i + k) % n] for k in range(-4, 5)) / 9.0 for i in range(n)
+        )
+        self.prior_s: float | None = None
         self.fallback_ticks = 0
         self.last: dict[str, float] = {}
         self.prev_throttle = 0.0
@@ -148,14 +152,12 @@ class Controller:
         self.recovery_side = 1.0
 
     # -- plan lookups -----------------------------------------------------
-    def _interp(self, table: np.ndarray, s: float) -> float:
+    def _interp(self, table: tuple[float, ...], s: float) -> float:
         position = (s % self.plan_length) / self.plan_step
         index = int(position)
         fraction = position - index
         n = len(table)
-        return float(
-            table[index % n] * (1.0 - fraction) + table[(index + 1) % n] * fraction
-        )
+        return table[index % n] * (1.0 - fraction) + table[(index + 1) % n] * fraction
 
     def line_lateral(self, s: float) -> float:
         """Racing-line lateral offset at s, bent around a registered opponent."""
@@ -209,16 +211,21 @@ class Controller:
     ) -> tuple[float, float]:
         """Project a world point onto the centerline near ``near_s``: returns (s, lateral)."""
         m = self.map
-        delta = np.abs(_wrap_signed(m.s - near_s, m.length_m))
-        mask = delta <= window_m
-        dx = x - m.cx[mask]
-        dz = z - m.cz[mask]
-        # distance along the local normal only counts if the point is beside the sample (not ahead/behind)
-        along = dx * m.fwd_x[mask] + dz * m.fwd_z[mask]
-        dist = np.hypot(dx, dz) + np.abs(along)
-        best = int(np.argmin(dist))
-        lateral = dx[best] * m.left_x[mask][best] + dz[best] * m.left_z[mask][best]
-        return float(m.s[mask][best]), float(lateral)
+        best_index = 0
+        best_dist = float("inf")
+        for raw_index in m.window_indices(near_s, window_m):
+            index = raw_index % m.count
+            dx = x - m.cx[index]
+            dz = z - m.cz[index]
+            # distance along the local tangent only counts if the point is beside the sample
+            along = dx * m.fwd_x[index] + dz * m.fwd_z[index]
+            dist = math.hypot(dx, dz) + abs(along)
+            if dist < best_dist:
+                best_dist = dist
+                best_index = index
+        dx = x - m.cx[best_index]
+        dz = z - m.cz[best_index]
+        return m.s[best_index], dx * m.left_x[best_index] + dz * m.left_z[best_index]
 
     # -- control ----------------------------------------------------------
     def __call__(self, sensors: RobotSensors) -> RobotCommand:
@@ -228,14 +235,28 @@ class Controller:
         if recovery is not None:
             return recovery
 
-        loc = self.map.localize(sensors, None)
+        loc = self.map.localize(
+            sensors, self.prior_s, prior_window_m=p.localize_window_m
+        )
+        if self.prior_s is not None and loc.residual > p.relocalize_residual:
+            loc = self.map.localize(
+                sensors, None
+            )  # lost (marshal reset, spin): search the whole track
         if loc.residual > p.residual_limit:
+            self.prior_s = None
             self.fallback_ticks += 1
             command = reactive_drive(sensors, REACTIVE_PARAMS)
             return self._command(command.throttle, command.steer)
 
         s = loc.s_m
         v = sensors.odometry.speed_mps
+        # Dead-reckoned prior for the next tick's local search.
+        self.prior_s = self.map.wrap(
+            s
+            + v
+            * sensors.dt_s
+            * math.cos(math.radians(sensors.camera.heading_error_degrees))
+        )
         psi = math.radians(sensors.imu.heading_degrees)
         fx, fz = math.sin(psi), math.cos(psi)
         rx, rz = fz, -fx
@@ -482,70 +503,65 @@ class Controller:
         first = math.floor((opp_s - p.opponent_window_before_m - 30.0) / step)
         last = math.ceil((opp_s + p.opponent_window_after_m + 6.0) / step)
         count = last - first + 1
-        ss: npt.NDArray[np.float64] = (
-            first + np.arange(count, dtype=np.float64)
-        ) * step
+        ss = [(first + i) * step for i in range(count)]
         # Curvature of the bent line from the plan line's curvature and the smooth lateral deviation
         # delta(s) (positive = left): kappa = (kappa_plan + delta'') / (1 - kappa_plan * delta).
         # delta is a smooth blend, so its finite-difference second derivative is well behaved,
         # unlike curvature sampled from the kinked polyline centerline.
-        delta = np.array(
-            [
-                self.line_lateral(float(value))
-                - self._interp(self.offset, float(value))
-                for value in ss
-            ]
-        )
-        plan_kappa = np.array(
-            [self._interp(self.curvature, float(value)) for value in ss.tolist()]
-        )
-        second = np.zeros(count)
-        second[1:-1] = (delta[2:] - 2.0 * delta[1:-1] + delta[:-2]) / (step * step)
-        denominator = np.maximum(1.0 - plan_kappa * delta, 0.3)
-        kappa = np.abs((plan_kappa + second) / denominator)
-        v = np.sqrt(self.a_lat / np.maximum(kappa, 1e-6))
-        plan = np.array(
-            [self._interp(self.speed, float(value)) for value in ss.tolist()]
-        )
-        v = np.minimum(v, plan)
-        # Near the opponent, leave grip in reserve so the car actually tracks the bent line
-        # (tracking error grows quickly at the cornering limit).
-        rel = np.array(
-            [self.map.signed_delta(float(value), opp_s) for value in ss.tolist()]
-        )
-        near = (rel >= -25.0) & (rel <= 6.0)
-        reserve = np.sqrt(p.pass_grip_fraction * self.a_lat / np.maximum(kappa, 1e-6))
-        v = np.where(near, np.minimum(v, reserve), v)
+        delta = [
+            self.line_lateral(value) - self._interp(self.offset, value) for value in ss
+        ]
+        plan_kappa = [self._interp(self.curvature, value) for value in ss]
+        plan = [self._interp(self.speed, value) for value in ss]
+        v: list[float] = []
+        for i in range(count):
+            second = 0.0
+            if 0 < i < count - 1:
+                second = (delta[i + 1] - 2.0 * delta[i] + delta[i - 1]) / (step * step)
+            denominator = max(1.0 - plan_kappa[i] * delta[i], 0.3)
+            kappa = max(abs((plan_kappa[i] + second) / denominator), 1e-6)
+            speed = min(math.sqrt(self.a_lat / kappa), plan[i])
+            # Near the opponent, leave grip in reserve so the car actually tracks the bent line
+            # (tracking error grows quickly at the cornering limit).
+            rel = self.map.signed_delta(ss[i], opp_s)
+            if -25.0 <= rel <= 6.0:
+                speed = min(speed, math.sqrt(p.pass_grip_fraction * self.a_lat / kappa))
+            v.append(speed)
         # Backward braking pass with a friction circle: where the plan already uses most of the
         # lateral grip, little braking is allowed, so slowdowns move back onto straighter track.
-        lateral_use = np.clip((plan * plan * np.abs(plan_kappa)) / self.a_lat, 0.0, 1.0)
-        allowed = p.pass_brake_mps2 * np.clip(1.0 - lateral_use * lateral_use, 0.1, 1.0)
         for i in range(count - 2, -1, -1):
-            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * float(allowed[i]) * step))
-        self.pass_profile = (ss, v)
+            lateral_use = _clamp(
+                plan[i] * plan[i] * abs(plan_kappa[i]) / self.a_lat, 0.0, 1.0
+            )
+            allowed = p.pass_brake_mps2 * _clamp(
+                1.0 - lateral_use * lateral_use, 0.1, 1.0
+            )
+            v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * allowed * step))
+        self.pass_profile = (ss[0], v)
         self.pass_basis = basis
 
     def _pass_time_loss(self) -> float:
         """Seconds lost to the current pass profile relative to the plan speed."""
         if self.pass_profile is None:
             return 0.0
-        ss, v = self.pass_profile
-        plan = np.array(
-            [self._interp(self.speed, float(value)) for value in ss.tolist()]
-        )
-        return float(np.sum(self.plan_step * (1.0 / np.maximum(v, 1.0) - 1.0 / plan)))
+        start, v = self.pass_profile
+        loss = 0.0
+        for i, speed in enumerate(v):
+            plan = self._interp(self.speed, start + i * self.plan_step)
+            loss += self.plan_step * (1.0 / max(speed, 1.0) - 1.0 / plan)
+        return loss
 
     def _pass_speed(self, s: float) -> float:
         if self.pass_profile is None:
             return float("inf")
-        ss, v = self.pass_profile
-        rel = self.map.signed_delta(s, float(ss[0]))
-        if rel < 0.0 or rel > float(ss[-1] - ss[0]):
+        start, v = self.pass_profile
+        rel = self.map.signed_delta(s, start)
+        if rel < 0.0 or rel > (len(v) - 1) * self.plan_step:
             return float("inf")
         position = rel / self.plan_step
         index = min(int(position), len(v) - 2)
         fraction = position - index
-        return float(v[index] * (1.0 - fraction) + v[index + 1] * fraction)
+        return v[index] * (1.0 - fraction) + v[index + 1] * fraction
 
     def _recovery(self, sensors: RobotSensors) -> RobotCommand | None:
         """Wall contact at low speed: reverse with the nose swinging toward open track, then drive off."""
@@ -576,10 +592,6 @@ class Controller:
             self.recovery_ticks = 0
             return None
         return self._command(0.6, self.recovery_side * p.recovery_steer * 2.0)
-
-
-def _wrap_signed(values: np.ndarray, period: float) -> np.ndarray:
-    return (values + period / 2) % period - period / 2
 
 
 def create_controller() -> Controller:
