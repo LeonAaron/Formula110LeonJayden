@@ -42,14 +42,11 @@ def _forward_vector(heading_degrees: float) -> tuple[float, float]:
     return math.sin(radians), math.cos(radians)
 
 
-def _wrap_degrees(value: np.ndarray | float) -> np.ndarray | float:
-    return (value + 180.0) % 360.0 - 180.0
-
-
 @dataclass(frozen=True, slots=True)
 class Localization:
     s_m: float
-    lateral_m: float  # signed distance from centerline, positive = left of track direction
+    # Signed distance from the centerline, positive = left of the track direction.
+    lateral_m: float
     residual: float
     heading_track_degrees: float
 
@@ -57,10 +54,12 @@ class Localization:
 class TrackMap:
     """Fine-grained lookup tables for the default track."""
 
-    def __init__(self, model: TrackProgressModel | None = None, grid_step_m: float = GRID_STEP_M) -> None:
+    def __init__(
+        self, model: TrackProgressModel | None = None, grid_step_m: float = GRID_STEP_M
+    ) -> None:
         self.model = default_track_progress_model() if model is None else model
         self.length_m = self.model.total_length_m
-        count = int(round(self.length_m / grid_step_m))
+        count = round(self.length_m / grid_step_m)
         self.s = np.linspace(0.0, self.length_m, count, endpoint=False)
         lookahead = (4.0, 9.0, 16.0)
         self.lookahead_distances = lookahead
@@ -139,7 +138,9 @@ class TrackMap:
 
         # center = (C - P) . r with P = C + d * left  =>  center = -d (left . r)
         denom = lx * rx + lz * rz
-        safe = np.where(np.abs(denom) < 0.2, np.sign(denom) * 0.2 + (denom == 0) * 0.2, denom)
+        safe = np.where(
+            np.abs(denom) < 0.2, np.sign(denom) * 0.2 + (denom == 0) * 0.2, denom
+        )
         d = -center / safe
         px = cx + d * lx
         pz = cz + d * lz
@@ -151,7 +152,9 @@ class TrackMap:
             pred = (self.lax[k][mask] - px) * rx + (self.laz[k][mask] - pz) * rz
             residual += (pred - offsets[k]) ** 2
         heading_res = _wrap_signed(heading - psi - err, 360.0)
-        residual += (heading_res / 10.0) ** 2  # 10 degrees of heading error ~ 1 m of lookahead error
+        residual += (
+            heading_res / 10.0
+        ) ** 2  # 10 degrees of heading error ~ 1 m of lookahead error
         residual += np.where(np.abs(denom) < 0.2, 25.0, 0.0)
 
         if prior_s is not None and prior_weight > 0.0:

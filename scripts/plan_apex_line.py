@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -46,7 +48,7 @@ GRID_STEP_M = 0.5
 
 def build_centerline(step_m: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model = default_track_progress_model()
-    count = int(round(model.total_length_m / step_m))
+    count = round(model.total_length_m / step_m)
     s = np.linspace(0.0, model.total_length_m, count, endpoint=False)
     cx = np.empty(count)
     cz = np.empty(count)
@@ -61,15 +63,15 @@ def build_centerline(step_m: float) -> tuple[np.ndarray, np.ndarray, np.ndarray,
 
 
 def _path_energy(
-    d: "torch.Tensor",
-    cx: "torch.Tensor",
-    cz: "torch.Tensor",
-    lx: "torch.Tensor",
-    lz: "torch.Tensor",
+    d: torch.Tensor,
+    cx: torch.Tensor,
+    cz: torch.Tensor,
+    lx: torch.Tensor,
+    lz: torch.Tensor,
     *,
     mode: str,
     speed_args: dict[str, float],
-) -> "torch.Tensor":
+) -> torch.Tensor:
     px, pz = cx + d * lx, cz + d * lz
     tx, tz = torch.roll(px, -1) - px, torch.roll(pz, -1) - pz
     seg = torch.sqrt(tx * tx + tz * tz + 1e-12)
@@ -97,7 +99,9 @@ def _path_energy(
     return torch.sum(ds / vm)
 
 
-def inside_limits(cx: np.ndarray, cz: np.ndarray, *, max_offset_m: float, inside_margin_m: float) -> tuple[np.ndarray, np.ndarray]:
+def inside_limits(
+    cx: np.ndarray, cz: np.ndarray, *, max_offset_m: float, inside_margin_m: float
+) -> tuple[np.ndarray, np.ndarray]:
     """Per-point (left_limit, right_limit) for the offset: the corridor, tightened on the inside of
     a bend so the offset never reaches the centerline's own centre of curvature (which would fold the
     path into a cusp). Curvature is smoothed over a few samples first."""
@@ -111,7 +115,7 @@ def inside_limits(cx: np.ndarray, cz: np.ndarray, *, max_offset_m: float, inside
     kappa = sign * magnitude
     radius = 1.0 / np.maximum(magnitude, 1e-6)
     inside = np.maximum(0.0, np.minimum(max_offset_m, radius - inside_margin_m))
-    left_limit = np.where(kappa > 0, inside, max_offset_m)   # left turn: left side is the inside
+    left_limit = np.where(kappa > 0, inside, max_offset_m)  # left turn: left side is the inside
     right_limit = np.where(kappa < 0, inside, max_offset_m)
     return left_limit, right_limit
 
@@ -149,7 +153,7 @@ def optimize_offsets(
     optimizer = torch.optim.LBFGS([u], lr=0.5, max_iter=iterations, history_size=30, line_search_fn="strong_wolfe")
     args = speed_args or {}
 
-    def closure() -> "torch.Tensor":
+    def closure() -> torch.Tensor:
         optimizer.zero_grad()
         d = centre + half_span * torch.tanh(u)
         loss = _path_energy(d, cxt, czt, lxt, lzt, mode=mode, speed_args=args) + center_weight * torch.sum(d * d)
@@ -212,7 +216,9 @@ def lap_time(v: np.ndarray, seg: np.ndarray) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--corridor-margin", type=float, default=0.5, help="Clearance kept from the barrier face")
-    parser.add_argument("--inside-margin", type=float, default=1.5, help="Keep the line this far from a bend's centre of curvature")
+    parser.add_argument(
+        "--inside-margin", type=float, default=1.5, help="Keep the line this far from a bend's centre of curvature"
+    )
     parser.add_argument("--center-weight", type=float, default=1e-6)
     parser.add_argument("--iterations", type=int, default=400)
     parser.add_argument("--mode", choices=("curvature", "laptime", "both"), default="both")
@@ -234,11 +240,18 @@ def main() -> None:
     track_length_m = default_track_progress_model().total_length_m
     grid_step_m = track_length_m / len(s)
     speed_args = {
-        "a_lat": args.a_lat, "v_max": args.v_max, "a_acc_base": args.a_acc_base,
-        "a_acc_slope": args.a_acc_slope, "a_brake": args.a_brake, "power": args.power,
+        "a_lat": args.a_lat,
+        "v_max": args.v_max,
+        "a_acc_base": args.a_acc_base,
+        "a_acc_slope": args.a_acc_slope,
+        "a_brake": args.a_brake,
+        "power": args.power,
     }
     d = optimize_offsets(
-        cx, cz, lx, lz,
+        cx,
+        cz,
+        lx,
+        lz,
         max_offset_m=max_offset_m,
         inside_margin_m=args.inside_margin,
         center_weight=args.center_weight,
@@ -253,7 +266,10 @@ def main() -> None:
         v = speed_profile(kappa, seg, **speed_args)
         print(f"after curvature stage: min radius {1 / np.max(np.abs(kappa)):.2f} m, lap time {lap_time(v, seg):.2f} s")
         d = optimize_offsets(
-            cx, cz, lx, lz,
+            cx,
+            cz,
+            lx,
+            lz,
             max_offset_m=max_offset_m,
             inside_margin_m=args.inside_margin,
             center_weight=args.center_weight,
@@ -266,9 +282,13 @@ def main() -> None:
     px, pz = cx + d * lx, cz + d * lz
     kappa, seg = path_curvature(px, pz)
     v = speed_profile(
-        kappa, seg,
-        a_lat=args.a_lat, v_max=args.v_max,
-        a_acc_base=args.a_acc_base, a_acc_slope=args.a_acc_slope, a_brake=args.a_brake,
+        kappa,
+        seg,
+        a_lat=args.a_lat,
+        v_max=args.v_max,
+        a_acc_base=args.a_acc_base,
+        a_acc_slope=args.a_acc_slope,
+        a_brake=args.a_brake,
     )
     t_lap = lap_time(v, seg)
     total = float(np.sum(seg))
@@ -282,7 +302,13 @@ def main() -> None:
         return
 
     def fmt(values: np.ndarray) -> str:
-        return "(\n" + "\n".join("    " + ", ".join(f"{x:.4f}" for x in values[i : i + 8]) + "," for i in range(0, len(values), 8)) + "\n)"
+        return (
+            "(\n"
+            + "\n".join(
+                "    " + ", ".join(f"{x:.4f}" for x in values[i : i + 8]) + "," for i in range(0, len(values), 8)
+            )
+            + "\n)"
+        )
 
     body = f'''"""Generated by scripts/plan_apex_line.py — do not edit by hand.
 
@@ -300,19 +326,20 @@ A_LAT_MPS2 = {args.a_lat}
 A_BRAKE_MPS2 = {args.a_brake}
 V_MAX_MPS = {args.v_max}
 
-OFFSET_M = {fmt(d)}
+OFFSET_M: tuple[float, ...] = {fmt(d)}
 
-SPEED_MPS = {fmt(v)}
+SPEED_MPS: tuple[float, ...] = {fmt(v)}
 
-CURVATURE = {fmt(kappa)}
+CURVATURE: tuple[float, ...] = {fmt(kappa)}
 
 # Per-point lateral limits (metres): how far left / right of the centerline the car centre may go
 # without folding into the bend's centre of curvature or leaving the corridor.
-LEFT_LIMIT_M = {fmt(left_limit)}
+LEFT_LIMIT_M: tuple[float, ...] = {fmt(left_limit)}
 
-RIGHT_LIMIT_M = {fmt(right_limit)}
+RIGHT_LIMIT_M: tuple[float, ...] = {fmt(right_limit)}
 '''
     args.output.write_text(body)
+    subprocess.run([sys.executable, "-m", "ruff", "format", "--isolated", str(args.output)], check=False)
     print(f"wrote {args.output}")
 
 

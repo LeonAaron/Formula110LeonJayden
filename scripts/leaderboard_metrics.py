@@ -67,7 +67,9 @@ def run_trial(controller: RobotController, *, seed: int, seconds: float = 30.0) 
             config=FORMULA_VEHICLE_PHYSICS_CONFIG,
         )
         physics_scene.vehicles.append(robot)
-        runtime = RaceCarRuntime(robot=robot, tracker=lap_progress_tracker_for_spawn_pose(model=model, spawn_pose=spawn_pose))
+        runtime = RaceCarRuntime(
+            robot=robot, tracker=lap_progress_tracker_for_spawn_pose(model=model, spawn_pose=spawn_pose)
+        )
         elapsed_seconds = 0.0
         lap_crossing_times: list[float] = []
         previous_lap_count = 0

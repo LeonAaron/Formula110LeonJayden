@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from types import ModuleType
 
 import numpy as np
+import numpy.typing as npt
 
 from controllers import apex_plan as _default_plan
 from controllers.apex_map import TrackMap
@@ -78,6 +79,7 @@ class ApexParams:
     opponent_blend_m: float = 20.0
     opponent_blend_out_m: float = 14.0
     opponent_commit_m: float = 16.0
+    opponent_late_speed_mps: float = 8.0
     opponent_lookahead_max_m: float = 9.0
     opponent_edge_margin_m: float = 0.6
     opponent_follow_gap_m: float = 10.0
@@ -134,8 +136,13 @@ class Controller:
         self.last: dict[str, float] = {}
         self.prev_throttle = 0.0
         self.avoid: dict[str, float] = {}
-        self.pass_side = 0.0  # +1 pass on the left of the opponent, -1 on the right, 0 none
-        self.opponent: tuple[float, float] | None = None  # (s, lateral) of the opponent being avoided
+        self.pass_side = (
+            0.0  # +1 pass on the left of the opponent, -1 on the right, 0 none
+        )
+        self.pass_late = False  # opponent first seen too close to plan a bend: plan line + follow rule only
+        self.opponent: tuple[float, float] | None = (
+            None  # (s, lateral) of the opponent being avoided
+        )
         self.recovery_phase = 0  # 0 none, 1 reversing, 2 driving forward
         self.recovery_ticks = 0
         self.recovery_side = 1.0
@@ -146,19 +153,25 @@ class Controller:
         index = int(position)
         fraction = position - index
         n = len(table)
-        return float(table[index % n] * (1.0 - fraction) + table[(index + 1) % n] * fraction)
+        return float(
+            table[index % n] * (1.0 - fraction) + table[(index + 1) % n] * fraction
+        )
 
     def line_lateral(self, s: float) -> float:
         """Racing-line lateral offset at s, bent around a registered opponent."""
         d = self._interp(self.offset, s)
-        if self.opponent is None or self.pass_side == 0.0:
+        if self.opponent is None or self.pass_side == 0.0 or self.pass_late:
             return d
         p = self.params
         opp_s, opp_lat = self.opponent
         rel = self.map.signed_delta(s, opp_s)  # positive: s is past the opponent
         if rel < -p.opponent_window_before_m or rel > p.opponent_window_after_m:
             return d
-        required = self._clip_lateral(opp_lat + self.pass_side * p.opponent_clearance_m, s, margin=p.opponent_edge_margin_m)
+        required = self._clip_lateral(
+            opp_lat + self.pass_side * p.opponent_clearance_m,
+            s,
+            margin=p.opponent_edge_margin_m,
+        )
         smooth = self._interp(self.offset_smooth, s)
         # Deviation needed on the chosen side, measured against the smoothed plan lateral, through a
         # soft rectifier (width ~1 m) so the deviation stays C2 where the plan line crosses the
@@ -180,7 +193,10 @@ class Controller:
 
     def _clip_lateral(self, lateral: float, s: float, margin: float = 0.2) -> float:
         """Clip a lateral offset to the per-point limits (corridor and bend-inside fold limit)."""
-        return max(-self._interp(self.right_limit, s) + margin, min(self._interp(self.left_limit, s) - margin, lateral))
+        return max(
+            -self._interp(self.right_limit, s) + margin,
+            min(self._interp(self.left_limit, s) - margin, lateral),
+        )
 
     def line_point(self, s: float) -> tuple[float, float]:
         cx, cz = self.map.center_at(s)
@@ -188,7 +204,9 @@ class Controller:
         d = self.line_lateral(s)
         return cx + d * lx, cz + d * lz
 
-    def project(self, x: float, z: float, near_s: float, window_m: float = 40.0) -> tuple[float, float]:
+    def project(
+        self, x: float, z: float, near_s: float, window_m: float = 40.0
+    ) -> tuple[float, float]:
         """Project a world point onto the centerline near ``near_s``: returns (s, lateral)."""
         m = self.map
         delta = np.abs(_wrap_signed(m.s - near_s, m.length_m))
@@ -206,7 +224,6 @@ class Controller:
     def __call__(self, sensors: RobotSensors) -> RobotCommand:
         p = self.params
         wall = sensors.wall_lidar
-        speed_now = sensors.odometry.speed_mps
         recovery = self._recovery(sensors)
         if recovery is not None:
             return recovery
@@ -230,11 +247,18 @@ class Controller:
 
         # Opponent bookkeeping first: it can shorten the lookahead and bend the line.
         self.avoid = {}
-        self._register_opponent(sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m)
+        self._register_opponent(
+            sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m
+        )
 
         # Pure pursuit target on the racing line.
-        lookahead = min(p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0)))
-        if self.opponent is not None and -25.0 <= self.map.signed_delta(self.opponent[0], s) <= 6.0:
+        lookahead = min(
+            p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0))
+        )
+        if (
+            self.opponent is not None
+            and -25.0 <= self.map.signed_delta(self.opponent[0], s) <= 6.0
+        ):
             lookahead = min(lookahead, p.opponent_lookahead_max_m)
         s_target = s + lookahead
         tx, tz = self.line_point(s_target)
@@ -250,16 +274,23 @@ class Controller:
             steer -= p.lateral_gain * (self.line_lateral(s) - loc.lateral_m)
 
         # Speed target from the profile a little ahead of the car.
-        v_target = p.speed_scale * min(self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s))
+        v_target = p.speed_scale * min(
+            self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s)
+        )
         plan_target = v_target
         follow_active = 0.0
         if self.opponent is not None:
             self._ensure_pass_profile()
             if self.pass_profile is not None:
-                v_target = min(v_target, self._pass_speed(s + p.speed_lead_m), self._pass_speed(s))
+                v_target = min(
+                    v_target, self._pass_speed(s + p.speed_lead_m), self._pass_speed(s)
+                )
             opp_s, opp_lat = self.opponent
             gap_ahead = self.map.signed_delta(opp_s, s)
-            if 0.0 < gap_ahead < p.opponent_follow_gap_m and abs(loc.lateral_m - opp_lat) < p.opponent_clearance_m - 0.8:
+            if (
+                0.0 < gap_ahead < p.opponent_follow_gap_m
+                and abs(loc.lateral_m - opp_lat) < p.opponent_clearance_m - 0.8
+            ):
                 v_target = min(v_target, p.opponent_follow_speed_mps)
                 follow_active = 1.0
         # Throttle: the plan's own braking is never limited; extra braking asked for by the pass
@@ -270,7 +301,11 @@ class Controller:
         if follow_active:
             extra_cap = p.follow_brake
         else:
-            lateral_use = _clamp(v * v * abs(self._interp(self.curvature, s)) / self.a_lat, 0.0, 1.0)
+            lateral_use = max(
+                v * v * abs(self._interp(self.curvature, s)) / self.a_lat,
+                abs(sensors.imu.lateral_acceleration_mps2) / self.a_lat,
+            )
+            lateral_use = _clamp(lateral_use, 0.0, 1.0)
             extra_cap = p.pass_brake_max * (1.0 - lateral_use * lateral_use)
         throttle = min(plan_throttle, max(pass_throttle, -extra_cap))
 
@@ -278,7 +313,11 @@ class Controller:
         if sensors.contact.wall > 0.0:
             open_side = -1.0 if wall.left_m > wall.right_m else 1.0
             steer = open_side * p.contact_steer
-            throttle = min(throttle, p.contact_throttle) if throttle > 0.0 else p.contact_throttle
+            throttle = (
+                min(throttle, p.contact_throttle)
+                if throttle > 0.0
+                else p.contact_throttle
+            )
 
         # Safety: wall directly ahead.
         stop_distance = v * v / (2.0 * p.wall_stop_decel_mps2) + p.wall_stop_margin_m
@@ -290,11 +329,21 @@ class Controller:
             steer += emergency_side * p.emergency_steer
 
         self.last = {
-            "s": s, "lat": loc.lateral_m, "res": loc.residual, "v": v, "v_target": v_target,
-            "throttle": throttle, "steer": steer, "front": wall.front_m, "stop": stop_distance,
-            "wall_brake": float(wall.front_m < stop_distance), "lookahead": lookahead,
-            "line_lat": self.line_lateral(s), "curv": self._interp(self.curvature, s),
-            "plan_target": plan_target, "follow": follow_active,
+            "s": s,
+            "lat": loc.lateral_m,
+            "res": loc.residual,
+            "v": v,
+            "v_target": v_target,
+            "throttle": throttle,
+            "steer": steer,
+            "front": wall.front_m,
+            "stop": stop_distance,
+            "wall_brake": float(wall.front_m < stop_distance),
+            "lookahead": lookahead,
+            "line_lat": self.line_lateral(s),
+            "curv": self._interp(self.curvature, s),
+            "plan_target": plan_target,
+            "follow": follow_active,
             **{f"avoid_{k}": val for k, val in self.avoid.items()},
         }
         return self._command(throttle, steer)
@@ -325,6 +374,7 @@ class Controller:
         rx: float,
         rz: float,
         lateral: float = 0.0,
+        speed: float = 0.0,
     ) -> None:
         """Track the nearest opponent ahead, projected onto the track, and pick a passing side once.
 
@@ -337,10 +387,12 @@ class Controller:
             if self.map.signed_delta(s, opp_s) > p.opponent_window_after_m:
                 self.opponent = None
                 self.pass_side = 0.0
+                self.pass_late = False
                 self.pass_profile = None
                 self.pass_basis = None
         ahead = [
-            c for c in sensors.camera.competitors
+            c
+            for c in sensors.camera.competitors
             if c.distance_m <= p.opponent_range_m and abs(c.angle_degrees) <= 90.0
         ]
         if not ahead:
@@ -353,15 +405,28 @@ class Controller:
         rel = self.map.signed_delta(opp_s, s)
         if rel < -p.opponent_window_after_m:
             return
-        if self.pass_side == 0.0 or self.opponent is None or abs(self.map.signed_delta(opp_s, self.opponent[0])) > 5.0:
-            if rel < p.opponent_commit_m and abs(lateral - opp_lat) > 0.4:
+        if (
+            self.pass_side == 0.0
+            or self.opponent is None
+            or abs(self.map.signed_delta(opp_s, self.opponent[0])) > 5.0
+        ):
+            if rel < p.opponent_commit_m and speed > p.opponent_late_speed_mps:
+                # Discovered too close (barriers hide parked cars in hairpins): bending the line or
+                # re-profiling speed now would only unsettle the car. Keep the plan line and rely on
+                # the follow rule; pass on the side we are already on.
+                self.pass_late = True
+                side = 1.0 if lateral > opp_lat else -1.0
+            elif rel < p.opponent_commit_m and abs(lateral - opp_lat) > 0.4:
                 # Too close to cross over: pass on the side we are already on.
                 side = 1.0 if lateral > opp_lat else -1.0
+                self.pass_late = False
             else:
-                options = []
+                options: list[tuple[float, float]] = []
                 for candidate in (1.0, -1.0):
                     required = self._clip_lateral(
-                        opp_lat + candidate * p.opponent_clearance_m, opp_s, margin=p.opponent_edge_margin_m
+                        opp_lat + candidate * p.opponent_clearance_m,
+                        opp_s,
+                        margin=p.opponent_edge_margin_m,
                     )
                     if abs(required - opp_lat) < p.opponent_clearance_m - 0.4:
                         continue  # not enough room on that side
@@ -370,49 +435,84 @@ class Controller:
                     self.pass_side = candidate
                     self.pass_basis = None
                     self._ensure_pass_profile()
-                    options.append((self._pass_time_loss() + 0.3 * max(0.0, abs(required) - 2.5), candidate))
-                side = (1.0 if opp_lat <= 0.0 else -1.0) if not options else min(options)[1]
+                    options.append(
+                        (
+                            self._pass_time_loss()
+                            + 0.3 * max(0.0, abs(required) - 2.5),
+                            candidate,
+                        )
+                    )
+                side = (
+                    (1.0 if opp_lat <= 0.0 else -1.0)
+                    if not options
+                    else min(options)[1]
+                )
                 self.pass_basis = None
+                self.pass_late = False
             self.pass_side = side
         self.opponent = (opp_s, opp_lat)
-        self.avoid = {"opp_s": opp_s, "opp_lat": opp_lat, "rel": rel, "side": self.pass_side,
-                      "dist": competitor.distance_m, "angle": competitor.angle_degrees}
+        self.avoid = {
+            "opp_s": opp_s,
+            "opp_lat": opp_lat,
+            "rel": rel,
+            "side": self.pass_side,
+            "dist": competitor.distance_m,
+            "angle": competitor.angle_degrees,
+        }
 
     def _ensure_pass_profile(self) -> None:
         """Build (once per encounter) a grip- and brake-limited speed profile for the bent line."""
-        if self.opponent is None:
+        if self.opponent is None or self.pass_late:
             self.pass_profile = None
             self.pass_basis = None
             return
         opp_s, opp_lat = self.opponent
         basis = (opp_s, opp_lat, self.pass_side)
-        if self.pass_basis is not None and abs(self.map.signed_delta(opp_s, self.pass_basis[0])) < 0.3 \
-                and abs(opp_lat - self.pass_basis[1]) < 0.3 and self.pass_side == self.pass_basis[2]:
+        if (
+            self.pass_basis is not None
+            and abs(self.map.signed_delta(opp_s, self.pass_basis[0])) < 0.3
+            and abs(opp_lat - self.pass_basis[1]) < 0.3
+            and self.pass_side == self.pass_basis[2]
+        ):
             return
         p = self.params
         # Sample on the planner's own grid so the unbent sections reproduce the plan's curvature exactly
         # (the track normals are piecewise constant, so off-grid resampling would invent kinks).
         step = self.plan_step
-        first = int(math.floor((opp_s - p.opponent_window_before_m - 30.0) / step))
-        last = int(math.ceil((opp_s + p.opponent_window_after_m + 6.0) / step))
+        first = math.floor((opp_s - p.opponent_window_before_m - 30.0) / step)
+        last = math.ceil((opp_s + p.opponent_window_after_m + 6.0) / step)
         count = last - first + 1
-        ss = (first + np.arange(count)) * step
+        ss: npt.NDArray[np.float64] = (
+            first + np.arange(count, dtype=np.float64)
+        ) * step
         # Curvature of the bent line from the plan line's curvature and the smooth lateral deviation
         # delta(s) (positive = left): kappa = (kappa_plan + delta'') / (1 - kappa_plan * delta).
         # delta is a smooth blend, so its finite-difference second derivative is well behaved,
         # unlike curvature sampled from the kinked polyline centerline.
-        delta = np.array([self.line_lateral(float(value)) - self._interp(self.offset, float(value)) for value in ss])
-        plan_kappa = np.array([self._interp(self.curvature, float(value)) for value in ss])
+        delta = np.array(
+            [
+                self.line_lateral(float(value))
+                - self._interp(self.offset, float(value))
+                for value in ss
+            ]
+        )
+        plan_kappa = np.array(
+            [self._interp(self.curvature, float(value)) for value in ss.tolist()]
+        )
         second = np.zeros(count)
         second[1:-1] = (delta[2:] - 2.0 * delta[1:-1] + delta[:-2]) / (step * step)
         denominator = np.maximum(1.0 - plan_kappa * delta, 0.3)
         kappa = np.abs((plan_kappa + second) / denominator)
         v = np.sqrt(self.a_lat / np.maximum(kappa, 1e-6))
-        plan = np.array([self._interp(self.speed, float(value)) for value in ss])
+        plan = np.array(
+            [self._interp(self.speed, float(value)) for value in ss.tolist()]
+        )
         v = np.minimum(v, plan)
         # Near the opponent, leave grip in reserve so the car actually tracks the bent line
         # (tracking error grows quickly at the cornering limit).
-        rel = np.array([self.map.signed_delta(float(value), opp_s) for value in ss])
+        rel = np.array(
+            [self.map.signed_delta(float(value), opp_s) for value in ss.tolist()]
+        )
         near = (rel >= -25.0) & (rel <= 6.0)
         reserve = np.sqrt(p.pass_grip_fraction * self.a_lat / np.maximum(kappa, 1e-6))
         v = np.where(near, np.minimum(v, reserve), v)
@@ -430,7 +530,9 @@ class Controller:
         if self.pass_profile is None:
             return 0.0
         ss, v = self.pass_profile
-        plan = np.array([self._interp(self.speed, float(value)) for value in ss])
+        plan = np.array(
+            [self._interp(self.speed, float(value)) for value in ss.tolist()]
+        )
         return float(np.sum(self.plan_step * (1.0 / np.maximum(v, 1.0) - 1.0 / plan)))
 
     def _pass_speed(self, s: float) -> float:
@@ -454,7 +556,9 @@ class Controller:
             if sensors.contact.wall > 0.0 and abs(speed) < p.recovery_speed_mps:
                 self.recovery_phase = 1
                 self.recovery_ticks = 0
-                self.recovery_side = -1.0 if wall.left_m > wall.right_m else 1.0  # side that is open
+                self.recovery_side = (
+                    -1.0 if wall.left_m > wall.right_m else 1.0
+                )  # side that is open
             else:
                 return None
         self.recovery_ticks += 1
@@ -464,7 +568,9 @@ class Controller:
                 self.recovery_ticks = 0
                 return self._command(0.0, 0.0)
             # Reversing with the wheels turned toward the wall swings the nose toward open track.
-            return self._command(p.recovery_throttle, -self.recovery_side * p.recovery_steer * 2.0)
+            return self._command(
+                p.recovery_throttle, -self.recovery_side * p.recovery_steer * 2.0
+            )
         if self.recovery_ticks > p.recovery_forward_s * 60:
             self.recovery_phase = 0
             self.recovery_ticks = 0

@@ -35,7 +35,7 @@ class RaceRow:
     eliminated: bool
 
 
-def _passive_controller(sensors):  # noqa: ANN001, ANN202
+def _passive_controller(sensors: object) -> object:
     from racing import RobotCommand
 
     return RobotCommand(throttle=0.0, steer=0.0)
