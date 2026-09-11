@@ -17,9 +17,8 @@ Pipeline, every tick, from public sensors only:
 4. **Safety layer**: wall-lidar emergency braking and steering, contact
    recovery, and opponent avoidance from ``camera.competitors``. If the
    localization residual is ever implausible, the tick falls back to the
-   sensor-only learned controller (``controllers.learned``), or to the
-   reactive controller when the learned one cannot be loaded (its torch
-   dependency is not part of the simulator's own requirements).
+   sensor-only reactive controller (``controllers.reactive.Controller``,
+   which needs no map and no external dependencies).
 """
 
 from __future__ import annotations
@@ -27,14 +26,12 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
-from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 
 from controllers import apex_plan as _default_plan
 from controllers.apex_map import TrackMap
-from controllers.reactive import DEFAULT_PARAMS as REACTIVE_PARAMS
-from controllers.reactive import drive as reactive_drive
+from controllers.reactive import Controller as ReactiveController
 from racing import RobotCommand, RobotSensors
 
 RACING_NAME = "Apex Pilot"
@@ -100,21 +97,6 @@ class ApexParams:
 DEFAULT_PARAMS = ApexParams()
 
 
-def _load_fallback() -> Callable[[RobotSensors], RobotCommand]:
-    """Sensor-only controller used on ticks where Apex cannot trust its localization.
-
-    The learned controller is preferred. It needs torch and its weights file; when
-    either is unavailable (the grading sandbox installs only the simulator's own
-    dependencies) the reactive controller takes over so Apex still loads.
-    """
-    try:
-        from controllers.learned import create_controller as create_learned
-
-        return create_learned()
-    except (ImportError, OSError, RuntimeError):
-        return lambda sensors: reactive_drive(sensors, REACTIVE_PARAMS)
-
-
 def _load_plan() -> ModuleType:
     """Load the shipped plan, or an alternative file named by APEX_PLAN_PATH (experiments only)."""
     path = os.environ.get("APEX_PLAN_PATH")
@@ -132,7 +114,7 @@ class Controller:
     def __init__(self, params: ApexParams = DEFAULT_PARAMS) -> None:
         self.params = params
         self.map = TrackMap()
-        self.fallback = _load_fallback()
+        self.fallback = ReactiveController()  # sensor-only, stateful (coast tick, U-turn), no map
         apex_plan = _load_plan()
         self.max_offset_m = apex_plan.MAX_OFFSET_M
         self.a_lat = apex_plan.A_LAT_MPS2
