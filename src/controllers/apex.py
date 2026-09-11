@@ -17,7 +17,9 @@ Pipeline, every tick, from public sensors only:
 4. **Safety layer**: wall-lidar emergency braking and steering, contact
    recovery, and opponent avoidance from ``camera.competitors``. If the
    localization residual is ever implausible, the tick falls back to the
-   sensor-only reactive controller.
+   sensor-only learned controller (``controllers.learned``), or to the
+   reactive controller when the learned one cannot be loaded (its torch
+   dependency is not part of the simulator's own requirements).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
 
@@ -97,6 +100,21 @@ class ApexParams:
 DEFAULT_PARAMS = ApexParams()
 
 
+def _load_fallback() -> Callable[[RobotSensors], RobotCommand]:
+    """Sensor-only controller used on ticks where Apex cannot trust its localization.
+
+    The learned controller is preferred. It needs torch and its weights file; when
+    either is unavailable (the grading sandbox installs only the simulator's own
+    dependencies) the reactive controller takes over so Apex still loads.
+    """
+    try:
+        from controllers.learned import create_controller as create_learned
+
+        return create_learned()
+    except (ImportError, OSError, RuntimeError):
+        return lambda sensors: reactive_drive(sensors, REACTIVE_PARAMS)
+
+
 def _load_plan() -> ModuleType:
     """Load the shipped plan, or an alternative file named by APEX_PLAN_PATH (experiments only)."""
     path = os.environ.get("APEX_PLAN_PATH")
@@ -114,13 +132,12 @@ class Controller:
     def __init__(self, params: ApexParams = DEFAULT_PARAMS) -> None:
         self.params = params
         self.map = TrackMap()
+        self.fallback = _load_fallback()
         apex_plan = _load_plan()
         self.max_offset_m = apex_plan.MAX_OFFSET_M
         self.a_lat = apex_plan.A_LAT_MPS2
         self.a_brake = apex_plan.A_BRAKE_MPS2
-        self.pass_profile: tuple[float, list[float]] | None = (
-            None  # (start s, speeds on the plan grid)
-        )
+        self.pass_profile: tuple[float, list[float]] | None = None  # (start s, speeds on the plan grid)
         self.pass_basis: tuple[float, float, float] | None = None
         self.plan_step: float = apex_plan.GRID_STEP_M
         self.plan_length: float = apex_plan.TRACK_LENGTH_M
@@ -140,13 +157,9 @@ class Controller:
         self.last: dict[str, float] = {}
         self.prev_throttle = 0.0
         self.avoid: dict[str, float] = {}
-        self.pass_side = (
-            0.0  # +1 pass on the left of the opponent, -1 on the right, 0 none
-        )
+        self.pass_side = 0.0  # +1 pass on the left of the opponent, -1 on the right, 0 none
         self.pass_late = False  # opponent first seen too close to plan a bend: plan line + follow rule only
-        self.opponent: tuple[float, float] | None = (
-            None  # (s, lateral) of the opponent being avoided
-        )
+        self.opponent: tuple[float, float] | None = None  # (s, lateral) of the opponent being avoided
         self.recovery_phase = 0  # 0 none, 1 reversing, 2 driving forward
         self.recovery_ticks = 0
         self.recovery_side = 1.0
@@ -206,9 +219,7 @@ class Controller:
         d = self.line_lateral(s)
         return cx + d * lx, cz + d * lz
 
-    def project(
-        self, x: float, z: float, near_s: float, window_m: float = 40.0
-    ) -> tuple[float, float]:
+    def project(self, x: float, z: float, near_s: float, window_m: float = 40.0) -> tuple[float, float]:
         """Project a world point onto the centerline near ``near_s``: returns (s, lateral)."""
         m = self.map
         best_index = 0
@@ -235,27 +246,20 @@ class Controller:
         if recovery is not None:
             return recovery
 
-        loc = self.map.localize(
-            sensors, self.prior_s, prior_window_m=p.localize_window_m
-        )
+        loc = self.map.localize(sensors, self.prior_s, prior_window_m=p.localize_window_m)
         if self.prior_s is not None and loc.residual > p.relocalize_residual:
-            loc = self.map.localize(
-                sensors, None
-            )  # lost (marshal reset, spin): search the whole track
+            loc = self.map.localize(sensors, None)  # lost (marshal reset, spin): search the whole track
         if loc.residual > p.residual_limit:
             self.prior_s = None
             self.fallback_ticks += 1
-            command = reactive_drive(sensors, REACTIVE_PARAMS)
+            command = self.fallback(sensors)
             return self._command(command.throttle, command.steer)
 
         s = loc.s_m
         v = sensors.odometry.speed_mps
         # Dead-reckoned prior for the next tick's local search.
         self.prior_s = self.map.wrap(
-            s
-            + v
-            * sensors.dt_s
-            * math.cos(math.radians(sensors.camera.heading_error_degrees))
+            s + v * sensors.dt_s * math.cos(math.radians(sensors.camera.heading_error_degrees))
         )
         psi = math.radians(sensors.imu.heading_degrees)
         fx, fz = math.sin(psi), math.cos(psi)
@@ -268,18 +272,11 @@ class Controller:
 
         # Opponent bookkeeping first: it can shorten the lookahead and bend the line.
         self.avoid = {}
-        self._register_opponent(
-            sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m
-        )
+        self._register_opponent(sensors, s, px, pz, fx, fz, rx, rz, lateral=loc.lateral_m)
 
         # Pure pursuit target on the racing line.
-        lookahead = min(
-            p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0))
-        )
-        if (
-            self.opponent is not None
-            and -25.0 <= self.map.signed_delta(self.opponent[0], s) <= 6.0
-        ):
+        lookahead = min(p.lookahead_max_m, max(p.lookahead_min_m, p.lookahead_time_s * max(v, 0.0)))
+        if self.opponent is not None and -25.0 <= self.map.signed_delta(self.opponent[0], s) <= 6.0:
             lookahead = min(lookahead, p.opponent_lookahead_max_m)
         s_target = s + lookahead
         tx, tz = self.line_point(s_target)
@@ -295,17 +292,13 @@ class Controller:
             steer -= p.lateral_gain * (self.line_lateral(s) - loc.lateral_m)
 
         # Speed target from the profile a little ahead of the car.
-        v_target = p.speed_scale * min(
-            self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s)
-        )
+        v_target = p.speed_scale * min(self._interp(self.speed, s + p.speed_lead_m), self._interp(self.speed, s))
         plan_target = v_target
         follow_active = 0.0
         if self.opponent is not None:
             self._ensure_pass_profile()
             if self.pass_profile is not None:
-                v_target = min(
-                    v_target, self._pass_speed(s + p.speed_lead_m), self._pass_speed(s)
-                )
+                v_target = min(v_target, self._pass_speed(s + p.speed_lead_m), self._pass_speed(s))
             opp_s, opp_lat = self.opponent
             gap_ahead = self.map.signed_delta(opp_s, s)
             if (
@@ -334,11 +327,7 @@ class Controller:
         if sensors.contact.wall > 0.0:
             open_side = -1.0 if wall.left_m > wall.right_m else 1.0
             steer = open_side * p.contact_steer
-            throttle = (
-                min(throttle, p.contact_throttle)
-                if throttle > 0.0
-                else p.contact_throttle
-            )
+            throttle = min(throttle, p.contact_throttle) if throttle > 0.0 else p.contact_throttle
 
         # Safety: wall directly ahead.
         stop_distance = v * v / (2.0 * p.wall_stop_decel_mps2) + p.wall_stop_margin_m
@@ -412,9 +401,7 @@ class Controller:
                 self.pass_profile = None
                 self.pass_basis = None
         ahead = [
-            c
-            for c in sensors.camera.competitors
-            if c.distance_m <= p.opponent_range_m and abs(c.angle_degrees) <= 90.0
+            c for c in sensors.camera.competitors if c.distance_m <= p.opponent_range_m and abs(c.angle_degrees) <= 90.0
         ]
         if not ahead:
             return
@@ -426,11 +413,7 @@ class Controller:
         rel = self.map.signed_delta(opp_s, s)
         if rel < -p.opponent_window_after_m:
             return
-        if (
-            self.pass_side == 0.0
-            or self.opponent is None
-            or abs(self.map.signed_delta(opp_s, self.opponent[0])) > 5.0
-        ):
+        if self.pass_side == 0.0 or self.opponent is None or abs(self.map.signed_delta(opp_s, self.opponent[0])) > 5.0:
             if rel < p.opponent_commit_m and speed > p.opponent_late_speed_mps:
                 # Discovered too close (barriers hide parked cars in hairpins): bending the line or
                 # re-profiling speed now would only unsettle the car. Keep the plan line and rely on
@@ -458,16 +441,11 @@ class Controller:
                     self._ensure_pass_profile()
                     options.append(
                         (
-                            self._pass_time_loss()
-                            + 0.3 * max(0.0, abs(required) - 2.5),
+                            self._pass_time_loss() + 0.3 * max(0.0, abs(required) - 2.5),
                             candidate,
                         )
                     )
-                side = (
-                    (1.0 if opp_lat <= 0.0 else -1.0)
-                    if not options
-                    else min(options)[1]
-                )
+                side = (1.0 if opp_lat <= 0.0 else -1.0) if not options else min(options)[1]
                 self.pass_basis = None
                 self.pass_late = False
             self.pass_side = side
@@ -508,9 +486,7 @@ class Controller:
         # delta(s) (positive = left): kappa = (kappa_plan + delta'') / (1 - kappa_plan * delta).
         # delta is a smooth blend, so its finite-difference second derivative is well behaved,
         # unlike curvature sampled from the kinked polyline centerline.
-        delta = [
-            self.line_lateral(value) - self._interp(self.offset, value) for value in ss
-        ]
+        delta = [self.line_lateral(value) - self._interp(self.offset, value) for value in ss]
         plan_kappa = [self._interp(self.curvature, value) for value in ss]
         plan = [self._interp(self.speed, value) for value in ss]
         v: list[float] = []
@@ -530,12 +506,8 @@ class Controller:
         # Backward braking pass with a friction circle: where the plan already uses most of the
         # lateral grip, little braking is allowed, so slowdowns move back onto straighter track.
         for i in range(count - 2, -1, -1):
-            lateral_use = _clamp(
-                plan[i] * plan[i] * abs(plan_kappa[i]) / self.a_lat, 0.0, 1.0
-            )
-            allowed = p.pass_brake_mps2 * _clamp(
-                1.0 - lateral_use * lateral_use, 0.1, 1.0
-            )
+            lateral_use = _clamp(plan[i] * plan[i] * abs(plan_kappa[i]) / self.a_lat, 0.0, 1.0)
+            allowed = p.pass_brake_mps2 * _clamp(1.0 - lateral_use * lateral_use, 0.1, 1.0)
             v[i] = min(v[i], math.sqrt(v[i + 1] ** 2 + 2.0 * allowed * step))
         self.pass_profile = (ss[0], v)
         self.pass_basis = basis
@@ -572,9 +544,7 @@ class Controller:
             if sensors.contact.wall > 0.0 and abs(speed) < p.recovery_speed_mps:
                 self.recovery_phase = 1
                 self.recovery_ticks = 0
-                self.recovery_side = (
-                    -1.0 if wall.left_m > wall.right_m else 1.0
-                )  # side that is open
+                self.recovery_side = -1.0 if wall.left_m > wall.right_m else 1.0  # side that is open
             else:
                 return None
         self.recovery_ticks += 1
@@ -584,9 +554,7 @@ class Controller:
                 self.recovery_ticks = 0
                 return self._command(0.0, 0.0)
             # Reversing with the wheels turned toward the wall swings the nose toward open track.
-            return self._command(
-                p.recovery_throttle, -self.recovery_side * p.recovery_steer * 2.0
-            )
+            return self._command(p.recovery_throttle, -self.recovery_side * p.recovery_steer * 2.0)
         if self.recovery_ticks > p.recovery_forward_s * 60:
             self.recovery_phase = 0
             self.recovery_ticks = 0
