@@ -71,15 +71,22 @@ class ReactiveParams:
     turn_sharpness_deg: float = 13.06080719185704
     apex_bias_max_m: float = 0.4604484764745242
 
-    # Throttle: always chase max speed; cornering is handled by steering, not
-    # by slowing down.
-    max_speed_mps: float = 15.815503530875
+    # Throttle: chase max speed (the car's measured limits, not the old 15.8 m/s
+    # ceiling that was tuned around a broken brake); cornering is handled by
+    # steering, not by slowing down.
+    max_speed_mps: float = 30.0
     speed_gain: float = 0.5063421687653541
 
-    # Throttle: brake in time for the wall directly ahead.
-    brake_lead_time_s: float = 0.24393703057360375
-    brake_min_distance_m: float = 0.2412588895512276
+    # Throttle: brake in time for the wall directly ahead. The stopping distance
+    # comes from the car's measured braking limit (about 18 m/s^2 is the most
+    # it can shed while staying stable), plus a fixed margin.
+    brake_decel_mps2: float = 18.0
+    brake_margin_m: float = 0.5
     brake_gain: float = 1.4993178625857668
+
+    # Stalled against a wall (nearly stopped, wall right ahead): reverse with the
+    # wheels turned toward the wall so the nose swings toward open track.
+    stall_speed_mps: float = 1.5
 
 
 DEFAULT_PARAMS = ReactiveParams()
@@ -122,8 +129,11 @@ def drive(sensors: RobotSensors, params: ReactiveParams) -> RobotCommand:
     if sensors.contact.any_contact > 0.0:
         return _recovery_command(sensors, params)
 
-    steer = _steering_command(sensors, params)
-    throttle = _throttle_command(sensors, params)
+    stalled = (
+        sensors.odometry.speed_mps < params.stall_speed_mps and sensors.wall_lidar.front_m < params.emergency_front_m
+    )
+    steer = _steering_command(sensors, params, stalled)
+    throttle = params.recovery_throttle if stalled else _throttle_command(sensors, params)
     return RobotCommand(throttle=_clamp(throttle, -1.0, 1.0), steer=_clamp(steer, -1.0, 1.0))
 
 
@@ -133,7 +143,7 @@ def _recovery_command(sensors: RobotSensors, params: ReactiveParams) -> RobotCom
     return RobotCommand(throttle=params.recovery_throttle, steer=open_side * params.recovery_steer)
 
 
-def _steering_command(sensors: RobotSensors, params: ReactiveParams) -> float:
+def _steering_command(sensors: RobotSensors, params: ReactiveParams, stalled: bool = False) -> float:
     camera = sensors.camera
     wall = sensors.wall_lidar
 
@@ -155,6 +165,9 @@ def _steering_command(sensors: RobotSensors, params: ReactiveParams) -> float:
 
     if wall.front_m < params.emergency_front_m:
         emergency_side = -1.0 if wall.front_left_m > wall.front_right_m else 1.0
+        if stalled:
+            # Reversing: wheels toward the wall swing the nose toward the open side.
+            return _clamp(-emergency_side * params.emergency_steer, -params.steer_limit, params.steer_limit)
         steer += emergency_side * params.emergency_steer
 
     return _clamp(steer, -params.steer_limit, params.steer_limit)
@@ -185,8 +198,8 @@ def _throttle_command(sensors: RobotSensors, params: ReactiveParams) -> float:
     speed_mps = sensors.odometry.speed_mps
     wall = sensors.wall_lidar
 
-    brake_distance_m = max(params.brake_min_distance_m, speed_mps * params.brake_lead_time_s)
-    if wall.front_m < brake_distance_m:
+    brake_distance_m = speed_mps * speed_mps / (2.0 * params.brake_decel_mps2) + params.brake_margin_m
+    if speed_mps > 0.0 and wall.front_m < brake_distance_m:
         deficit = _clamp((brake_distance_m - wall.front_m) / brake_distance_m, 0.0, 1.0)
         return -params.brake_gain * deficit
 
