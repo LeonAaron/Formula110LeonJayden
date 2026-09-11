@@ -1,4 +1,3 @@
-
 """Reactive rule-based controller: sensor-driven throttle and steering.
 
 All tunable gains and thresholds live in ``ReactiveParams`` so a future
@@ -19,6 +18,14 @@ Two design choices worth noting:
   reactive, wall-proximity braking check — a hard safety floor against
   destruction, not a cornering strategy. Turn geometry is handled entirely by
   steering (apex bias + wall avoidance).
+
+:func:`drive` stays a pure sensor-to-command mapping. :class:`Controller`
+wraps it with the one piece of state the simulator's throttle model needs:
+a negative throttle while rolling forward requests a direction change, and
+the simulator keeps braking on every following tick until the car has nearly
+stopped, unless a tick with throttle exactly ``0.0`` clears the request. So
+the controller coasts for exactly one tick when switching from braking back
+to driving; without that, every brake application turns into a full stop.
 """
 
 from __future__ import annotations
@@ -78,9 +85,36 @@ class ReactiveParams:
 DEFAULT_PARAMS = ReactiveParams()
 
 
+class Controller:
+    """Stateful wrapper around :func:`drive` that applies the direction-change rule."""
+
+    def __init__(self, params: ReactiveParams = DEFAULT_PARAMS) -> None:
+        self.params = params
+        self.prev_throttle = 0.0
+
+    def __call__(self, sensors: RobotSensors) -> RobotCommand:
+        command = drive(sensors, self.params)
+        return self._command(command.throttle, command.steer)
+
+    def _command(self, throttle: float, steer: float) -> RobotCommand:
+        """Coast for one tick between braking and driving so the brake request clears."""
+        throttle = _clamp(throttle, -1.0, 1.0)
+        if self.prev_throttle < 0.0 and throttle > 0.0:
+            throttle = 0.0
+        self.prev_throttle = throttle
+        return RobotCommand(throttle=throttle, steer=_clamp(steer, -1.0, 1.0))
+
+
+def create_controller() -> Controller:
+    return Controller()
+
+
+_SHARED_CONTROLLER = Controller()
+
+
 def control(sensors: RobotSensors) -> RobotCommand:
-    """Map one sensor snapshot to a throttle/steer command."""
-    return drive(sensors, DEFAULT_PARAMS)
+    """Map one sensor snapshot to a throttle/steer command (module-level, shared state)."""
+    return _SHARED_CONTROLLER(sensors)
 
 
 def drive(sensors: RobotSensors, params: ReactiveParams) -> RobotCommand:
