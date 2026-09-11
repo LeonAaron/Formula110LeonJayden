@@ -2,7 +2,8 @@
 
 Runs ``scripts/export_student_controllers.py --all-controllers`` (so the
 ``controllers/`` package, including ``formula110-submission.json``, is at the
-archive root) and then adds the project's ``pyproject.toml`` at the root.
+archive root) and then adds the project's ``pyproject.toml`` and a copy of the
+manifest at the root, which is where the current grader looks for it.
 
 Usage:
     uv run python scripts/build_submission.py
@@ -20,6 +21,7 @@ import export_student_controllers as exporter
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = PROJECT_ROOT / "artifacts" / "formula110-submission.zip"
 ROOT_FILES = ("pyproject.toml",)
+MANIFEST = PROJECT_ROOT / "src" / "controllers" / "formula110-submission.json"
 
 
 def build_submission(output: Path) -> Path:
@@ -27,6 +29,7 @@ def build_submission(output: Path) -> Path:
     with zipfile.ZipFile(written, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name in ROOT_FILES:
             archive.write(PROJECT_ROOT / name, arcname=name)
+        archive.write(MANIFEST, arcname=MANIFEST.name)
     return written
 
 
