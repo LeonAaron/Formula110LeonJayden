@@ -5,7 +5,9 @@ description = "Small Ursina 3D racing starter project"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "cma>=4.4.4",
     "panda3d==1.10.13",
+    "torch>=2.14.0",
     "ursina<8",
 ]
 

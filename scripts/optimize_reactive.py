@@ -36,7 +36,7 @@ import random
 from dataclasses import fields, replace
 from statistics import mean
 
-from controllers.reactive import DEFAULT_PARAMS, ReactiveParams, drive
+from controllers.reactive import DEFAULT_PARAMS, Controller, ReactiveParams, drive
 from racing import HeadToHeadTeamRaceStats, RobotCommand, RobotSensors, run_headless_head_to_head
 
 ELIMINATION_PENALTY_M = 350.0
@@ -71,13 +71,9 @@ def _passive_controller(sensors: RobotSensors) -> RobotCommand:
     return RobotCommand(throttle=0.0, steer=0.0)
 
 
-def make_controller(params: ReactiveParams):
-    """Build a callable controller bound to one parameter set."""
-
-    def control(sensors: RobotSensors) -> RobotCommand:
-        return drive(sensors, params)
-
-    return control
+def make_controller(params: ReactiveParams) -> Controller:
+    """Build a controller bound to one parameter set (fresh state per race)."""
+    return Controller(params)
 
 
 def evaluate_params(params: ReactiveParams, *, seeds: tuple[int, ...], round_seconds: float) -> float:
@@ -116,9 +112,7 @@ def run_search(
     """Run the evolution strategy; return the best params found and their fitness."""
     rng = random.Random(rng_seed)
     base_genome = genome_from_params(DEFAULT_PARAMS)
-    population = [base_genome] + [
-        mutate(base_genome, rng, mutation_sigma_fraction) for _ in range(population_size - 1)
-    ]
+    population = [base_genome] + [mutate(base_genome, rng, mutation_sigma_fraction) for _ in range(population_size - 1)]
 
     best_genome = base_genome
     best_fitness = float("-inf")
@@ -198,9 +192,7 @@ def trace_race(
     return trace, result.races[0].challenger
 
 
-def summarize_trace(
-    trace: list[dict[str, float]], stats: HeadToHeadTeamRaceStats, *, seed: int, tail: int
-) -> None:
+def summarize_trace(trace: list[dict[str, float]], stats: HeadToHeadTeamRaceStats, *, seed: int, tail: int) -> None:
     """Print a diagnostic report: what happened, when, and the sensor state at the time."""
     distance_m = stats.distances_m[0]
     laps = stats.lap_counts[0]
